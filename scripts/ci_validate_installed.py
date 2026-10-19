@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 def run(command: list[str], *, cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-    process = subprocess.run(command, cwd=cwd, env=env, text=True, capture_output=True)
+    process = subprocess.run(command, cwd=cwd, env=env, text=True, encoding="utf-8", capture_output=True)
     if process.returncode:
         print(process.stdout, end="")
         print(process.stderr, end="", file=sys.stderr)
@@ -60,6 +60,9 @@ def main() -> int:
 
         for module in ("service_probe", "discovery", "document_parse"):
             run([sys.executable, "-m", "litsearch." + module, "--help"], cwd=fixture, env=env)
+        for module in ("dynamic_citations", "word_plugin"):
+            run([sys.executable, "-m", "litsearch_zotero." + module, "--help"], cwd=fixture, env=env)
+        run([sys.executable, "-c", "import lxml.etree"], cwd=fixture, env=env)
 
         run([sys.executable, "-X", "utf8", "-m", "unittest", "discover", "-s", "tests", "-q"], cwd=fixture, env=env)
         demo_out = args.demo_out.resolve()

@@ -4,6 +4,7 @@ __pycache__/
 *.py[cod]
 build/
 dist/
+tmp/
 *.egg-info/
 
 # Local runs and credentials

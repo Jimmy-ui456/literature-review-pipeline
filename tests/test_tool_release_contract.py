@@ -16,17 +16,22 @@ MODULES = (
     "litsearch/__init__.py", "litsearch/cli.py", "litsearch/core.py",
     "litsearch/service_probe.py", "litsearch/discovery.py", "litsearch/document_parse.py",
     "litsearch_zotero/__init__.py", "litsearch_zotero/attach_pdfs.py",
+    "litsearch_zotero/dynamic_citations.py", "litsearch_zotero/word_plugin.py",
 )
 ENTRIES = """[console_scripts]
 literature-service-probe = litsearch.service_probe:main
 literature-discover = litsearch.discovery:main
 literature-parse = litsearch.document_parse:main
+literature-cite = litsearch_zotero.dynamic_citations:main
+literature-cite-word = litsearch_zotero.word_plugin:main
 """
 METADATA = """Metadata-Version: 2.4
 Name: d-pan-literature-pipeline
 Version: 3.0.0
 Requires-Dist: openpyxl<4,>=3.1
 Requires-Dist: pypdf<7,>=5
+Requires-Dist: lxml<7,>=5; extra == "citations"
+Requires-Dist: pywin32<400,>=306; sys_platform == "win32" and extra == "citations"
 Requires-Dist: pdfplumber<0.12,>=0.11; extra == "tables"
 Requires-Dist: pdfplumber<0.12,>=0.11; extra == "ocr"
 Requires-Dist: pypdfium2<6,>=4.30; extra == "ocr"
@@ -86,6 +91,19 @@ class ToolReleaseContractTests(unittest.TestCase):
     def test_missing_extra_dependency_is_rejected(self):
         metadata = METADATA.replace('Requires-Dist: Pillow<13,>=10; extra == "ocr"\n', "")
         report = self.inspect(metadata=metadata)
+        self.assertIn("optional_dependency_missing", {x["rule"] for x in report["findings"]})
+
+    def test_citation_modules_commands_and_dependencies_must_ship_together(self):
+        for module in ("dynamic_citations", "word_plugin"):
+            with self.subTest(module=module):
+                report = self.inspect(omitted=f"litsearch_zotero/{module}.py")
+                self.assertIn("required_member_missing", {x["rule"] for x in report["findings"]})
+        report = self.inspect(metadata=METADATA.replace('Requires-Dist: lxml<7,>=5; extra == "citations"\n', ""))
+        self.assertIn("optional_dependency_missing", {x["rule"] for x in report["findings"]})
+        report = self.inspect(entries=ENTRIES.replace('literature-cite-word = litsearch_zotero.word_plugin:main\n', ""))
+        self.assertIn("tool_entrypoint_missing", {x["rule"] for x in report["findings"]})
+        report = self.inspect(metadata=METADATA.replace('sys_platform == "win32" and extra == "citations"',
+                                                        'extra == "citations"'))
         self.assertIn("optional_dependency_missing", {x["rule"] for x in report["findings"]})
 
     def test_lookalike_constraint_does_not_pass(self):

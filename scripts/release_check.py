@@ -62,7 +62,7 @@ def generated_exclusion(rel: str) -> str | None:
     parts = PurePosixPath(rel).parts
     if rel in {"PKG-INFO", "setup.cfg"}:
         return "sdist_generated_metadata"
-    if any(part in {".git", ".validation", ".venv", "venv", "build", "dist", "__pycache__"} or part.endswith(".egg-info") for part in parts):
+    if any(part in {".git", ".validation", ".venv", "venv", "build", "dist", "tmp", "__pycache__"} or part.endswith(".egg-info") for part in parts):
         return "known_generated_directory"
     return None
 def prepare_stage(root: Path, stage: Path, config: dict) -> tuple[list[dict], list[str], list[dict]]:
@@ -115,7 +115,8 @@ def inspect_archive(archive: Path, config: dict) -> dict:
         if expected not in names: findings.append({"path":expected,"rule":"required_member_missing"})
     required_modules=("litsearch/__init__.py","litsearch/cli.py","litsearch/core.py",
                       "litsearch/service_probe.py","litsearch/discovery.py","litsearch/document_parse.py",
-                      "litsearch_zotero/__init__.py","litsearch_zotero/attach_pdfs.py")
+                      "litsearch_zotero/__init__.py","litsearch_zotero/attach_pdfs.py",
+                      "litsearch_zotero/dynamic_citations.py", "litsearch_zotero/word_plugin.py")
     for req in required_modules:
         expected=req if kind=="wheel" else "d_pan_literature_pipeline-3.0.0/"+req
         if expected not in names: findings.append({"path":expected,"rule":"required_member_missing"})
@@ -132,6 +133,7 @@ def inspect_archive(archive: Path, config: dict) -> dict:
         package, constraints=requirement.split(">=",1); expected=(">="+constraints.split(",")[0], "<"+constraints.split(",")[1][1:])
         if not any(dependency_contract(line, package, expected) for line in normalized): findings.append({"path":str(metadata_name),"rule":"required_dependency_constraint_missing","detail":requirement})
     optional = {
+        "citations": {"lxml": (">=5", "<7")},
         "tables": {"pdfplumber": (">=0.11", "<0.12")},
         "ocr": {"pdfplumber": (">=0.11", "<0.12"), "pypdfium2": (">=4.30", "<6"), "pillow": (">=10", "<13")},
         "parsing": {"pdfplumber": (">=0.11", "<0.12"), "pypdfium2": (">=4.30", "<6"),
@@ -142,9 +144,22 @@ def inspect_archive(archive: Path, config: dict) -> dict:
             if not any(dependency_contract(line, package, bounds, extra) for line in normalized):
                 findings.append({"path":str(metadata_name), "rule":"optional_dependency_missing",
                                  "detail":extra + ":" + package})
+    win32_markers = {'sys_platform=="win32"andextra=="citations"',
+                     'extra=="citations"andsys_platform=="win32"'}
+    has_word_bridge = False
+    for line in normalized:
+        requirement, _, marker = line.partition(";")
+        if (dependency_contract(requirement, "pywin32", (">=306", "<400"))
+                and marker.replace("'", '"') in win32_markers):
+            has_word_bridge = True
+    if not has_word_bridge:
+        findings.append({"path":str(metadata_name), "rule":"optional_dependency_missing",
+                         "detail":"citations:pywin32_windows_only"})
     entry_name = (next((n for n in names if n.endswith(".dist-info/entry_points.txt")), None)
                   if kind == "wheel" else "d_pan_literature_pipeline-3.0.0/d_pan_literature_pipeline.egg-info/entry_points.txt")
     expected_entries = {
+        "literature-cite": "litsearch_zotero.dynamic_citations:main",
+        "literature-cite-word": "litsearch_zotero.word_plugin:main",
         "literature-service-probe": "litsearch.service_probe:main",
         "literature-discover": "litsearch.discovery:main",
         "literature-parse": "litsearch.document_parse:main",

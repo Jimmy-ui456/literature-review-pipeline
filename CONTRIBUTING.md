@@ -3,7 +3,7 @@
 本仓库是唯一源码入口，不是从外层工作区手工同步的发行副本。请在本仓库根目录使用 Python 3.10+ 的虚拟环境安装项目，再运行：
 
 ```powershell
-python -m pip install -e ".[parsing,test,release]"
+python -m pip install -e ".[parsing,test,release,citations]"
 python -m unittest discover -v
 python scripts/run_synthetic_demo.py --out-dir .validation/contributor-demo
 python scripts/build_release.py --out-dir dist/contributor-release

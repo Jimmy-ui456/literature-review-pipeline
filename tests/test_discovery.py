@@ -71,6 +71,7 @@ class DiscoveryTests(unittest.TestCase):
         plan = self.plan(aliases=["synthetic additional alias"])
         result = execute(plan, self.root / "plan", client=fake)
         self.assertEqual(result["status"], "offline_plan")
+        self.assertEqual(result["schema_version"], 2)
         self.assertFalse(fake.urls)
         saved = json.loads((self.root / "plan" / "plan.json").read_text(encoding="utf-8"))
         self.assertEqual(saved, plan)
@@ -93,8 +94,13 @@ class DiscoveryTests(unittest.TestCase):
             return page(rows=[article("1"), article("2")], count=3) if cursor == "*" else page(rows=[article("3")], count=3)
         report, fake, out = self.run_discovery(handler)
         self.assertEqual(report["counts"]["candidates"], 3)
+        self.assertEqual(report["schema_version"], 2)
         self.assertEqual(len(fake.urls), 2)
         self.assertEqual(report["status"], "bounded_retrieval_finished")
+        self.assertEqual(report["counts"]["requests"], 2)
+        self.assertEqual(report["counts"]["page_attempts"], 2)
+        self.assertEqual(report["counts"]["pages"], 2)
+        self.assertEqual(report["coverage"][0]["status"], "api_reported_end")
         for row in json.loads((out / "responses.json").read_text()):
             self.assertEqual(hashlib.sha256((out / row["file"]).read_bytes()).hexdigest(), row["sha256"])
 
@@ -201,7 +207,8 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(report["counts"]["candidates"], 1)
         candidate = report["candidates"][0]
         self.assertEqual(candidate["conflicts"]["title"], ["Title A", "Title B"])
-        self.assertEqual(len(candidate["observations"]), 2)
+        self.assertEqual(len(candidate["observations"]), 3)
+        self.assertIn("user_alias", {obs["route"].get("route_class") for obs in candidate["observations"]})
         self.assertEqual(candidate["status"], "unreviewed")
         self.assertIsNone(candidate["approval"])
 
@@ -242,8 +249,190 @@ class DiscoveryTests(unittest.TestCase):
         report, _, _ = self.run_discovery(handler, self.plan(seeds=[{"doi": "10.1234/seed"}]))
         self.assertEqual(report["counts"]["candidates"], 2)
         self.assertEqual(report["counts"]["unresolved"], 1)
-        self.assertTrue(any(row["status"] == "forward_citations_unavailable" for row in report["coverage"]))
+        self.assertEqual(report["seed_routes"][0]["registration"]["status"], "registered")
+        self.assertEqual(report["seed_routes"][0]["doi_resolution"]["status"], "zero_hit")
+        self.assertEqual(report["seed_routes"][0]["forward_citations"]["status"], "unavailable")
+        self.assertIn("no_forward_endpoint", report["seed_routes"][0]["forward_citations"]["reason"])
         self.assertFalse(report["exhaustive_recall"])
+
+    def test_doi_fallback_gets_budget_before_keyword_continuations(self):
+        plan = self.plan(seeds=[{"doi": "10.1234/seed"}], pages=5)
+        def handler(url):
+            if url.startswith("https://api.crossref.org/works/10.1234%2Fseed"):
+                return {"status": "ok", "message": {"DOI": "10.1234/seed",
+                        "reference-count": 0, "reference": []}}
+            params = parse_qs(urlsplit(url).query)
+            if params.get("query") == ['DOI:"10.1234/seed"']:
+                return page()
+            cursor = params.get("cursorMark", ["*"])[0]
+            offset = 0 if cursor == "*" else int(cursor.split("-")[-1]) * 2
+            next_cursor = "cursor-1" if cursor == "*" else "cursor-" + str(int(cursor.split("-")[-1]) + 1)
+            return page(rows=[article(str(100 + offset)), article(str(101 + offset))],
+                        count=100, cursor=next_cursor)
+        report, fake, _ = self.run_discovery(handler, plan)
+        crossref_url = next(i for i, url in enumerate(fake.urls)
+                            if url.startswith("https://api.crossref.org/works/10.1234%2Fseed"))
+        continuation_urls = [i for i, url in enumerate(fake.urls)
+                             if parse_qs(urlsplit(url).query).get("cursorMark", ["*"])[0] != "*"]
+        self.assertTrue(continuation_urls, (report["counts"], report["truncations"], report["coverage"], fake.urls))
+        self.assertLess(crossref_url, min(continuation_urls))
+        crossref_routes = [row for row in report["coverage"]
+                           if row["route"].get("provider") == "crossref"
+                           and row["route"].get("seed") == {"doi": "10.1234/seed"}
+                           and row["route"].get("direction") == "backward"]
+        self.assertEqual(len(crossref_routes), 1)
+        self.assertEqual(crossref_routes[0]["status"], "api_reported_end")
+        seed_route = report["seed_routes"][0]["backward_citations"]
+        self.assertEqual(seed_route["route"], crossref_routes[0]["route"])
+        self.assertEqual(seed_route["status"], crossref_routes[0]["status"])
+        self.assertLessEqual(report["counts"]["pages"], plan["budgets"]["pages"])
+
+    def test_doi_resolver_pagination_completes_before_crossref_fallback(self):
+        plan = self.plan(seeds=[{"doi": "10.1234/seed"}], aliases=["specific alias"], pages=8)
+        doi_calls = 0
+
+        def handler(url):
+            nonlocal doi_calls
+            parts = urlsplit(url)
+            if parts.netloc == "api.crossref.org":
+                self.fail("Crossref fallback must wait for the paginating DOI resolver")
+            if parts.path.endswith("/references") or parts.path.endswith("/citations"):
+                return page(parts.path.rsplit("/", 1)[1])
+            query = parse_qs(parts.query).get("query", [""])[0]
+            if query == 'DOI:"10.1234/seed"':
+                doi_calls += 1
+                cursor = parse_qs(parts.query).get("cursorMark", ["*"])[0]
+                if cursor == "*":
+                    return page(rows=[article("50", doi="10.1234/seed"),
+                                      article("51", doi="10.1234/seed")], count=3,
+                                cursor="resolver-next")
+                return page(rows=[article("52", doi="10.1234/seed")], count=3,
+                            cursor="resolver-finished")
+            return page()
+
+        report, fake, _ = self.run_discovery(handler, plan)
+        self.assertEqual(doi_calls, 2)
+        self.assertFalse(any(urlsplit(url).netloc == "api.crossref.org" for url in fake.urls))
+        seed_route = report["seed_routes"][0]
+        self.assertEqual(seed_route["doi_resolution"]["status"], "api_reported_end")
+        self.assertEqual(seed_route["backward_citations"]["status"], "zero_hit")
+        self.assertEqual(seed_route["forward_citations"]["status"], "zero_hit")
+        for field, direction in (("backward_citations", "backward"),
+                                 ("forward_citations", "forward")):
+            audit = [row for row in report["coverage"]
+                     if row["route"].get("seed") == {"doi": "10.1234/seed"}
+                     and row["route"].get("direction") == direction
+                     and row["route"].get("provider") == "europepmc"]
+            self.assertEqual(len(audit), 1, field)
+            self.assertEqual(seed_route[field]["route"], audit[0]["route"])
+
+    def test_depth_zero_registers_seed_without_neighbor_requests(self):
+        plan = self.plan(seeds=[{"source": "MED", "id": "1"}], depth=0)
+        report, fake, _ = self.run_discovery(lambda _: page(), plan)
+        paths = [urlsplit(url).path for url in fake.urls]
+        self.assertFalse(any(path.endswith("/references") or path.endswith("/citations") for path in paths))
+        self.assertEqual(report["counts"]["candidates"], 1)
+        for field in ("backward_citations", "forward_citations"):
+            detail = report["seed_routes"][0][field]
+            self.assertEqual(detail["status"], "budget_truncated")
+            self.assertEqual(detail["reason"], "depth_budget")
+        self.assertFalse(report["edges"])
+
+    def test_depth_one_fetches_seed_neighbors_but_does_not_expand_them(self):
+        plan = self.plan(seeds=[{"source": "MED", "id": "1"}], depth=1)
+        def handler(url):
+            path = urlsplit(url).path
+            if path.endswith("/references"):
+                parent = path.split("/")[-2]
+                return page("references", [article("2")]) if parent == "1" else page("references")
+            if path.endswith("/citations"):
+                parent = path.split("/")[-2]
+                return page("citations", [article("3")]) if parent == "1" else page("citations")
+            return page("search")
+        report, fake, _ = self.run_discovery(handler, plan)
+        paths = [urlsplit(url).path for url in fake.urls]
+        self.assertIn("/europepmc/webservices/rest/MED/1/references", paths)
+        self.assertIn("/europepmc/webservices/rest/MED/1/citations", paths)
+        self.assertFalse(any("/MED/2/" in path or "/MED/3/" in path for path in paths))
+        self.assertTrue(any(row["reason"] == "depth_budget" for row in report["truncations"]))
+
+    def test_alias_and_seed_get_first_pages_before_broad_query_continuations(self):
+        plan = self.plan(seeds=[{"source": "MED", "id": "1"}], aliases=["specific alias"], pages=6)
+        def handler(url):
+            parts = urlsplit(url)
+            params = parse_qs(parts.query)
+            if parts.path.endswith("/references") or parts.path.endswith("/citations"):
+                kind = parts.path.rsplit("/", 1)[1]
+                return page(kind)
+            query = params["query"][0]
+            if query == 'TITLE_ABS:"specific alias"':
+                return page()
+            cursor = params["cursorMark"][0]
+            ids = (1, 2) if cursor == "*" else (3, 4)
+            return page(rows=[article(str(i)) for i in ids], count=6,
+                        cursor="next" if cursor == "*" else "next2")
+        report, client, _ = self.run_discovery(handler, plan)
+        parsed = [(urlsplit(url).path, parse_qs(urlsplit(url).query)) for url in client.urls]
+        self.assertIn('TITLE_ABS:"specific alias"', parsed[0][1].get("query", []))
+        self.assertTrue(any(path.endswith("/MED/1/references") for path, _ in parsed[:5]))
+        self.assertTrue(any(path.endswith("/MED/1/citations") for path, _ in parsed[:5]))
+        self.assertEqual(parsed[5][1]["query"], [plan["queries"][0]])
+        self.assertEqual(parsed[5][1]["cursorMark"], ["next"])
+        self.assertEqual(report["counts"]["page_attempts"], 6)
+        self.assertEqual(report["counts"]["pages"], 6)
+        term_route = next(row for row in report["coverage"]
+                          if row["route"].get("route_class") == "topic_terms")
+        alias_route = next(row for row in report["coverage"]
+                           if row["route"].get("route_class") == "user_alias")
+        seed_route = next(row for row in report["coverage"]
+                          if row["route"].get("provider") == "europepmc"
+                          and row["route"].get("direction") == "backward")
+        source_route = next(row for row in report["coverage"]
+                            if row["route"].get("route_class") == "source_baseline")
+        self.assertEqual([alias_route["priority_order"], seed_route["priority_order"],
+                          source_route["priority_order"], term_route["priority_order"]], [1, 2, 3, 4])
+        self.assertEqual(term_route["status"], "budget_truncated")
+        self.assertEqual(term_route["pages_validated"], 1)
+        self.assertFalse(report["exhaustive_recall"])
+
+    def test_failed_and_unattempted_routes_are_distinct_and_failures_are_not_pages(self):
+        plan = self.plan(seeds=[{"source": "MED", "id": "1"}], aliases=["fragile alias"], requests=1)
+        def handler(url):
+            if parse_qs(urlsplit(url).query).get("query") == ['TITLE_ABS:"fragile alias"']:
+                return RuntimeError("network error")
+            return page()
+        report, client, _ = self.run_discovery(handler, plan)
+        self.assertEqual(len(client.urls), 1)
+        self.assertEqual(report["counts"]["requests"], 1)
+        self.assertEqual(report["counts"]["page_attempts"], 1)
+        self.assertEqual(report["counts"]["pages"], 0)
+        alias_route = next(row for row in report["coverage"]
+                           if row["route"].get("route_class") == "user_alias")
+        source_route = next(row for row in report["coverage"]
+                            if row["route"].get("route_class") == "source_baseline")
+        self.assertEqual(alias_route["status"], "failed")
+        self.assertEqual(alias_route["priority_order"], 1)
+        self.assertEqual(source_route["status"], "unattempted")
+        self.assertEqual(source_route["priority_order"], 3)
+        self.assertTrue(source_route["reason"] in (None, "request_budget"))
+
+    def test_seed_record_budget_keeps_all_routes_and_marks_uncovered_work(self):
+        plan = self.plan(seeds=[{"source": "MED", "id": "1"}, {"source": "MED", "id": "2"}],
+                         aliases=["specific alias"], records=1)
+        report, client, _ = self.run_discovery(
+            lambda _: self.fail("record-budget stop must happen before network requests"), plan)
+        self.assertFalse(client.urls)
+        self.assertEqual(report["counts"]["observations"], 1)
+        self.assertEqual(len(report["seed_routes"]), 2)
+        self.assertEqual(report["seed_routes"][0]["registration"]["status"], "registered")
+        self.assertEqual(report["seed_routes"][1]["registration"]["status"], "budget_truncated")
+        for seed_route in report["seed_routes"]:
+            self.assertEqual(seed_route["backward_citations"]["status"], "budget_truncated")
+            self.assertEqual(seed_route["forward_citations"]["status"], "budget_truncated")
+        alias_route = next(row for row in report["coverage"]
+                           if row["route"].get("route_class") == "user_alias")
+        self.assertEqual(alias_route["status"], "budget_truncated")
+        self.assertEqual(alias_route["reason"], "record_budget")
 
     def test_partial_failure_keeps_work_and_does_not_echo_exception(self):
         sentinel = "private" + "_credential_" + "marker"

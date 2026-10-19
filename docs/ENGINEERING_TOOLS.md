@@ -52,7 +52,9 @@ aliases.json 是普通短语数组，例如 ["目标物的另一种写法", "明
 
 Europe PMC 支持检索、向后找参考文献、向前找引用文章。Crossref 可检索一般学科论文并提供已登记的向后引用；它没有本工具所用的向前引用接口。覆盖范围会保存到报告，不宣称查全所有文献。--source 可指定检索源；未指定时使用 Europe PMC。相同 DOI/来源 ID 的候选保留全部发现途径及冲突信息；没有可靠标识符的参考条目保留为 unresolved。
 
-默认请求/页/观察条目/引用深度预算是 50/30/1000/1；--page-size 默认为 100。预算计数包含重复观察和未解析条目。达到预算或待扩展深度边界会明确报告 partial。plan.json 保存课题快照、指纹、查询和预算；discovery.json 保存候选、引用边、冲突、覆盖和失败；responses.json 及 response_*.json 保存请求索引和原响应哈希。
+默认请求/页/观察条目/引用深度预算是 50/30/1000/1；--page-size 默认为 100。计划中的用户别名是独立检索路线；种子先登记，DOI 解析与向后/向前引用路线分别审计。调度先轮流请求别名、种子路线、来源基线和主题词的首页，再按路线轮流请求后续页，避免宽泛词分页耗尽预算而跳过具体别名或种子。请求失败不重试。预算计数包含重复观察和未解析条目；请求数包含失败请求，page_attempts 记录发起的页请求，pages 只计通过响应结构验证的页面，因此网络失败不会伪装成成功页或消耗页预算。请求/页预算及未完成的路线都会保留在报告中。
+
+`discovery.json` 使用 schema_version 2；coverage 按 source/provider、query/seed、route_class、方向和深度列路线及页数、API 报告总数、返回数和原因。`priority_order` 给出固定顺序：1 用户别名，2 显式种子解析/引文，3 来源基线，4 主题词，5 新发现邻居；即使预算截断，未尝试路线仍保留并带预算原因，部分路线标为 budget_truncated。状态包括 unattempted、failed、zero_hit、partial、api_reported_end、budget_truncated；Crossref 未提供的向前接口或无法解析的 DOI 会标为 unavailable，不与失败或零命中混为一谈。counts.requests、counts.page_attempts 和 counts.pages 分别是请求总数、页请求尝试数和已验证页面数。达到预算或待扩展深度边界会明确报告 partial。plan.json 保存课题快照、指纹、查询和预算；discovery.json 保存候选、引用边、冲突、覆盖和失败；responses.json 及 response_*.json 保存请求索引和原响应哈希。
 
 退出码 0 表示离线计划或所声明范围内的读取结束，2 表示部分结果，1 表示输入、复放或输出错误。候选一直保持未审阅状态，不自动进入稿件或人工批准清单。
 
@@ -69,9 +71,9 @@ python -m litsearch.document_parse scanned.pdf --ocr auto --language eng+chi_sim
 python -m litsearch.document_parse local-paper.pdf --table-strategy text --out-dir validation/text-table
 ```
 
-document.json 保存来源 SHA-256、页码、原生字符、OCR 词位置与置信度，以及表格的单元格、合并跨度、原始矩阵和位置。空格不被猜填。HTML 表头及 tfoot 按显式结构记录；PDF 的表头、单位、邻近图注和脚注是待核对线索。跨页续表仅标候选关系，不自动拼接或继承实验条件。
+document.json 保存来源 SHA-256、页码、原生字符、OCR 词位置与置信度，以及表格的单元格、合并跨度、原始矩阵和位置。空格不被猜填。HTML 表头及 tfoot 按显式结构记录；PDF 的表头、单位、邻近图注和脚注是待核对线索。PDF 无框表优先在表题附近、同一栏的局部区域找表；检测到双栏时避免把整页两栏正文并入同一张表。结构或几何可信度不足的候选标为 `untrusted` / `not_reliably_extracted`，不暴露伪造单元格，并将该页标为 partial。跨页续表仅标候选关系，不自动拼接或继承实验条件。
 
-OCR 默认关闭。auto 在原生文字不足时启用，always 强制保留另一层识别结果；原始 PDF/图片保持原样。扫描表格的行列是位置启发式候选，可能误把双栏正文当表格，必须核对。数字、单位、实验条件不会自动改写。所有结果保持 AI pending、science approval none、human review null。
+OCR 默认关闭。auto 在原生文字不足时启用，always 强制保留另一层识别结果；原始 PDF/图片保持原样。扫描表格的行列是位置启发式候选，仍可能把双栏正文当表格，必须核对；低置信度的原生 PDF 表格会明确拒绝可靠提取，而不是包装成 pending review。数字、单位、实验条件不会自动改写。所有结果保持 AI pending、science approval none、human review null。
 
 输入大小、页数、格数、跨度、像素、OCR 超时、总时间和输出大小均有显式限额。CLI 使用隔离解析进程；缺少依赖、损坏文件或失败页面会报错或返回部分结果。退出码 0 表示提取完成但待核对，3 表示部分结果，2 表示失败。详细参数用 --help 查看。
 

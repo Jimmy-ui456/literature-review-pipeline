@@ -37,7 +37,11 @@ def reject_redirected_path(path: Path) -> None:
 
 def output_path(root: Path, output: Path) -> Path:
     root = root.resolve()
-    target = Path(os.path.abspath(output if output.is_absolute() else root / output))
+    unresolved = Path(os.path.abspath(output if output.is_absolute() else root / output))
+    reject_redirected_path(unresolved)
+    # Resolve Windows short-name aliases only after checking raw parents for
+    # reparse points; otherwise an alias can evade the containment comparison.
+    target = unresolved.resolve()
     dist = root / "dist"
     if target == dist or dist not in target.parents:
         raise ValueError("--out-dir must be a NEW child directory inside this checkout's dist directory")

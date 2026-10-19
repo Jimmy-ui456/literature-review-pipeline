@@ -16,6 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+citations = ["lxml>=5,<7", "pywin32>=306,<400; sys_platform == 'win32'"]
 tables = ["pdfplumber>=0.11,<0.12"]
 ocr = ["pdfplumber>=0.11,<0.12", "pypdfium2>=4.30,<6", "Pillow>=10,<13"]
 parsing = ["pdfplumber>=0.11,<0.12", "pypdfium2>=4.30,<6", "Pillow>=10,<13"]
@@ -28,6 +29,8 @@ engineering-review = "litsearch.engineering:main"
 literature-service-probe = "litsearch.service_probe:main"
 literature-discover = "litsearch.discovery:main"
 literature-parse = "litsearch.document_parse:main"
+literature-cite = "litsearch_zotero.dynamic_citations:main"
+literature-cite-word = "litsearch_zotero.word_plugin:main"
 
 [tool.setuptools.packages.find]
 include = ["litsearch*", "litsearch_zotero*"]

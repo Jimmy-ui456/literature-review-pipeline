@@ -25,7 +25,7 @@ jobs:
       - name: Generate and gate release from the source checkout
         run: python scripts/build_release.py --out-dir dist/ci-release
       - name: Install built wheel
-        run: python -m pip install --force-reinstall "dist/ci-release/artifacts/d_pan_literature_pipeline-3.0.0-py3-none-any.whl[parsing,test]"
+        run: python -m pip install --force-reinstall "dist/ci-release/artifacts/d_pan_literature_pipeline-3.0.0-py3-none-any.whl[parsing,test,citations]"
       - name: Install OCR engine for synthetic integration checks
         if: runner.os == 'Linux'
         run: |

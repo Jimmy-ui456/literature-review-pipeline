@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class BuildReleaseTests(unittest.TestCase):
     def candidate(self, temporary: str) -> Path:
-        root = Path(temporary) / "checkout"
+        root = (Path(temporary) / "checkout").resolve()
         (root / "litsearch").mkdir(parents=True)
         (root / "release_allowlist.json").write_bytes((ROOT / "release_allowlist.json").read_bytes())
         for name, text in {"README.md": "Synthetic release fixture\n", "LICENSE": "Synthetic license\n",
@@ -75,6 +75,17 @@ class BuildReleaseTests(unittest.TestCase):
                 with self.subTest(output=output), self.assertRaisesRegex(ValueError, "inside this checkout"):
                     release.build_release(root, output, source_only=True)
             self.assertFalse((root / "litsearch/new").exists())
+
+    @unittest.skipUnless(__import__("os").name == "nt", "Windows short paths only")
+    def test_short_name_output_alias_is_resolved_within_the_same_root(self):
+        import ctypes
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.candidate(temp)
+            buffer = ctypes.create_unicode_buffer(32768)
+            if not ctypes.windll.kernel32.GetShortPathNameW(str(root), buffer, len(buffer)):
+                self.skipTest("Filesystem does not expose short-name aliases")
+            short = Path(buffer.value)
+            self.assertEqual(release.output_path(root, short / "dist/one"), root / "dist/one")
 
     def test_missing_required_source_fails_before_writes(self):
         with tempfile.TemporaryDirectory() as temp:

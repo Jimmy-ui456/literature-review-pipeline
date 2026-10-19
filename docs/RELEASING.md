@@ -14,7 +14,7 @@
 从本仓库根目录、独立虚拟环境执行：
 
 ```powershell
-python -m pip install -e ".[parsing,test,release]"
+python -m pip install -e ".[parsing,test,release,citations]"
 python -m unittest discover -s tests -v
 python scripts/build_release.py --out-dir dist/local-release
 ```
@@ -36,6 +36,8 @@ dist/local-release/
 只有全部请求的门禁通过后才写成功清单。失败时保留部分输出供检查，不能当作可交付包；修复后用新目录重试。只需要离线源码 ZIP 时可加 `--source-only`，此模式的清单明确把 wheel/sdist 门禁标为 `not_run`，不等于完整发布验证。源码 ZIP 的成员和时间戳固定；不宣称 wheel/sdist 或整个清单逐字节可复现。
 
 CI 调用同一个 `scripts/build_release.py`，随后安装生成的 wheel，在源码目录之外运行测试和合成演示，避免测试误用工作树代替安装包。CI 不代表跨课题科学评测。
+
+`tmp/` 是本机临时研究资料目录，与 `.validation/`、`dist/` 一样明确排除；它不会进入源码包、安装包或 Git 提交。其他未知目录仍会触发发行门禁，不能静默忽略。
 
 ## 上传 GitHub
 

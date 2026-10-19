@@ -270,6 +270,11 @@ class Discovery:
         self.edges: list[dict] = []
         self.identity_redirects: dict[str, str] = {}
         self.observations = self.pages = 0
+        self.page_attempts = 0
+        self._coverage_index: dict[str, dict] = {}
+        self._page_states: dict[str, dict] = {}
+        self._task_results: dict[str, list] = {}
+        self.seed_routes: list[dict] = []
         self.replay: dict[str, bytes] | None = None
         if replay_dir is not None:
             if replay_dir.is_symlink():
@@ -302,7 +307,60 @@ class Discovery:
 
     def _stop(self, reason: str, route: dict) -> None:
         self.truncations.append({"reason": reason, "route": route})
+        audit_route = {key: value for key, value in route.items() if key != "page"}
+        audit = self._coverage_for(audit_route)
+        audit["status"] = "budget_truncated"
+        audit["reason"] = reason
         raise BudgetStop(reason)
+
+    @staticmethod
+    def _route_key(route: dict) -> str:
+        return json.dumps(route, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def _coverage_priority(route: dict) -> tuple[int, str]:
+        route_class = route.get("route_class")
+        if route_class == "user_alias":
+            return 1, "user_alias"
+        if route_class == "source_baseline":
+            return 3, "source_baseline"
+        if route_class == "topic_terms":
+            return 4, "topic_terms"
+        if route.get("kind") == "seed" or "seed" in route:
+            return 2, "seed_routes"
+        return 5, "discovered_neighbor_routes"
+
+    def _coverage_for(self, route: dict) -> dict:
+        key = self._route_key(route)
+        if key not in self._coverage_index:
+            priority_order, priority = self._coverage_priority(route)
+            row = {"route": dict(route), "status": "unattempted", "page_attempts": 0,
+                   "pages_validated": 0, "reported_total": None, "returned": 0,
+                   "pages": [], "reason": None, "priority_order": priority_order,
+                   "priority": priority}
+            self._coverage_index[key] = row
+            self.coverage.append(row)
+        return self._coverage_index[key]
+
+    def _fail_coverage(self, route: dict, reason: str) -> None:
+        audit = self._coverage_for(route)
+        audit["status"] = "partial" if audit["pages_validated"] else "failed"
+        audit["reason"] = reason
+
+    @staticmethod
+    def _interleave(lanes: list[list[dict]]) -> list[dict]:
+        """Take one route from each priority lane per round, preserving lane order."""
+        positions = [0] * len(lanes)
+        result = []
+        while True:
+            advanced = False
+            for index, lane in enumerate(lanes):
+                if positions[index] < len(lane):
+                    result.append(lane[positions[index]])
+                    positions[index] += 1
+                    advanced = True
+            if not advanced:
+                return result
 
     def _get(self, url: str, route: dict) -> tuple[dict, int]:
         if len(self.requests) >= self.budgets.requests:
@@ -420,15 +478,22 @@ class Discovery:
         return candidate["candidate_id"], fresh
 
     def _pages(self, kind: str, route: dict, *, query: str | None = None,
-               epmc: tuple[str, str] | None = None):
-        cursor, offset, total, page = "*", 0, None, 1
-        seen_cursors: set[str] = set()
-        seen_pages: set[str] = set()
-        seen_identifiers: set[str] = set()
+               epmc: tuple[str, str] | None = None, one_page: bool = False):
+        route_key = self._route_key(route)
+        state = self._page_states.setdefault(route_key, {"cursor": "*", "offset": 0, "total": None,
+            "page": 1, "done": False, "seen_cursors": set(), "seen_pages": set(),
+            "seen_identifiers": set()})
+        audit = self._coverage_for(route)
+        if state["done"]:
+            return
         while True:
             if self.pages >= self.budgets.pages:
                 self._stop("page_budget", route)
-            self.pages += 1
+            if len(self.requests) >= self.budgets.requests:
+                self._stop("request_budget", route)
+            cursor, offset, total, page = state["cursor"], state["offset"], state["total"], state["page"]
+            self.page_attempts += 1
+            audit["page_attempts"] += 1
             if kind == "search":
                 url = EPMC + "/search?" + urlencode({"query": query, "format": "json", "resultType": "core",
                        "pageSize": self.budgets.page_size, "cursorMark": cursor, "synonym": "true"})
@@ -436,12 +501,19 @@ class Discovery:
                 assert epmc is not None
                 url = EPMC + f"/{epmc[0]}/{epmc[1]}/{kind}?" + urlencode(
                     {"format": "json", "pageSize": self.budgets.page_size, "page": page})
-            data, request_id = self._get(url, {**route, "page": page})
+            try:
+                data, request_id = self._get(url, {**route, "page": page})
+            except BudgetStop:
+                raise
+            except Exception:
+                self._fail_coverage(route, "request_or_response_failure")
+                state["done"] = True
+                raise
             try:
                 rows, count = self._page(data, kind, offset, total)
                 total = count
                 digest = hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
-                if rows and digest in seen_pages:
+                if rows and digest in state["seen_pages"]:
                     raise ValueError("repeated page payload")
                 page_ids = []
                 for row in rows:
@@ -449,55 +521,102 @@ class Discovery:
                     # A source/id identifies an API row; DOI-only bibliography
                     # entries are monitored when an index ID is unavailable.
                     if ids:
-                        if ids[0] in seen_identifiers or ids[0] in page_ids:
+                        if ids[0] in state["seen_identifiers"] or ids[0] in page_ids:
                             raise ValueError("repeated indexed identity during pagination")
                         page_ids.append(ids[0])
-                seen_identifiers.update(page_ids)
-                seen_pages.add(digest)
-                entry = {"route": route, "request_id": request_id, "page": page,
-                         "reported_total": total, "returned": len(rows), "offset": offset,
-                         "status": "page_validated"}
-                self.coverage.append(entry)
+                state["seen_identifiers"].update(page_ids)
+                state["seen_pages"].add(digest)
+                next_offset = offset + len(rows)
+                done = next_offset >= total
+                page_entry = {"request_id": request_id, "page": page, "reported_total": total,
+                              "returned": len(rows), "offset": offset, "status": "page_validated"}
+                self.pages += 1
+                audit["pages_validated"] += 1
+                audit["reported_total"] = total
+                audit["returned"] += len(rows)
+                audit["pages"].append(page_entry)
+                state.update(total=total, offset=next_offset, done=done)
+                if done:
+                    state["done"] = True
+                    audit["status"] = "zero_hit" if total == 0 else "api_reported_end"
+                    audit["reason"] = None
+                else:
+                    audit["status"] = "partial"
+                    audit["reason"] = "more_pages_available"
                 for item in rows:
                     yield item, request_id
-                offset += len(rows)
-                if offset >= total:
-                    entry["status"] = "api_reported_end"
+                if done:
                     return
                 if kind == "search":
                     nxt = data.get("nextCursorMark")
-                    if not isinstance(nxt, str) or not nxt or len(nxt) > 4096 or nxt == cursor or nxt in seen_cursors:
+                    if (not isinstance(nxt, str) or not nxt or len(nxt) > 4096
+                            or nxt == cursor or nxt in state["seen_cursors"]):
                         raise ValueError("missing or cyclic pagination cursor")
-                    seen_cursors.add(cursor)
-                    cursor = nxt
-                page += 1
+                    state["seen_cursors"].add(cursor)
+                    state["cursor"] = nxt
+                else:
+                    pass
+                state["page"] = page + 1
+                if one_page:
+                    return
             except BudgetStop:
                 raise
             except (ValueError, TypeError) as exc:
                 self.errors.append({"request_id": request_id, "route": route,
                                     "error_type": type(exc).__name__, "reason": "malformed_or_repeated_page"})
+                self._fail_coverage(route, "malformed_or_repeated_page")
+                state["done"] = True
                 raise
 
-    def _crossref(self, doi: str, parent: str, depth: int) -> list[tuple[dict, str]]:
-        route = {"kind": "references", "provider": "crossref", "parent": parent, "depth": depth}
+    def _crossref(self, doi: str, parent: str, depth: int, seed: dict | None = None) -> list[tuple[dict, str]]:
+        route = {"kind": "references", "provider": "crossref", "parent": parent,
+                 "seed": seed or {"doi": doi}, "direction": "backward", "depth": depth}
+        audit = self._coverage_for(route)
         if self.pages >= self.budgets.pages:
             self._stop("page_budget", route)
-        self.pages += 1
-        data, rid = self._get(CROSSREF + quote(doi, safe=""), route)
+        if len(self.requests) >= self.budgets.requests:
+            self._stop("request_budget", route)
+        self.page_attempts += 1
+        audit["page_attempts"] += 1
+        try:
+            data, rid = self._get(CROSSREF + quote(doi, safe=""), route)
+        except BudgetStop:
+            raise
+        except Exception:
+            self._fail_coverage(route, "request_or_response_failure")
+            raise
         message = data.get("message")
         if data.get("status") != "ok" or not isinstance(message, dict) or _doi(message.get("DOI")) != doi:
+            self._fail_coverage(route, "reference_metadata_identity_mismatch")
             raise ValueError("Crossref response identity mismatch")
         rows = message.get("reference")
         if rows is None:
-            self.coverage.append({"route": route, "request_id": rid, "status": "reference_metadata_absent"})
+            self.pages += 1
+            audit["pages_validated"] += 1
+            audit["status"] = "reference_metadata_absent"
+            audit["reason"] = "reference_list_not_deposited"
+            audit["pages"].append({"request_id": rid, "page": 1, "reported_total": None,
+                                   "returned": 0, "offset": 0, "status": "metadata_absent"})
             return []
         if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            self._fail_coverage(route, "invalid_reference_list")
             raise ValueError("invalid Crossref reference list")
         reported = message.get("reference-count")
         if reported is not None and (type(reported) is not int or reported < len(rows)):
+            self._fail_coverage(route, "invalid_reference_count")
             raise ValueError("invalid Crossref reference-count")
+        self.pages += 1
+        audit["pages_validated"] += 1
         if reported is not None and reported > len(rows):
             self.truncations.append({"reason": "crossref_deposit_subset", "route": route})
+            audit["status"] = "partial"
+            audit["reason"] = "crossref_deposit_subset"
+        else:
+            audit["status"] = "api_reported_end"
+        audit["reported_total"] = reported
+        audit["returned"] = len(rows)
+        audit["pages"].append({"request_id": rid, "page": 1, "reported_total": reported,
+                               "returned": len(rows), "offset": 0, "status": "page_validated"})
         frontier = []
         for row in rows:
             child, _ = self._add(row, route, rid)
@@ -505,21 +624,33 @@ class Discovery:
                 self.edges.append({"from": parent, "to": child, "kind": "references",
                                    "provider": "crossref", "request_id": rid, "depth": depth})
                 frontier.append(({"doi": _doi(row.get("DOI"))}, child))
-        self.coverage.append({"route": route, "request_id": rid, "status": "deposited_references_read",
-                              "returned": len(rows), "reported_total": reported})
         return frontier
 
-    def _crossref_search_pages(self, query: str, route: dict):
-        cursor, offset, total, page = "*", 0, None, 1
-        seen_cursors: set[str] = set()
-        seen_dois: set[str] = set()
+    def _crossref_search_pages(self, query: str, route: dict, *, one_page: bool = False):
+        route_key = self._route_key(route)
+        state = self._page_states.setdefault(route_key, {"cursor": "*", "offset": 0, "total": None,
+            "page": 1, "done": False, "seen_cursors": set(), "seen_dois": set()})
+        audit = self._coverage_for(route)
+        if state["done"]:
+            return
         while True:
             if self.pages >= self.budgets.pages:
                 self._stop("page_budget", route)
-            self.pages += 1
+            if len(self.requests) >= self.budgets.requests:
+                self._stop("request_budget", route)
+            cursor, offset, total, page = state["cursor"], state["offset"], state["total"], state["page"]
+            self.page_attempts += 1
+            audit["page_attempts"] += 1
             url = CROSSREF.rstrip("/") + "?" + urlencode(
                 {"query": query, "rows": self.budgets.page_size, "cursor": cursor})
-            data, rid = self._get(url, {**route, "page": page})
+            try:
+                data, rid = self._get(url, {**route, "page": page})
+            except BudgetStop:
+                raise
+            except Exception:
+                self._fail_coverage(route, "request_or_response_failure")
+                state["done"] = True
+                raise
             try:
                 message = data.get("message")
                 if data.get("status") != "ok" or not isinstance(message, dict):
@@ -544,124 +675,486 @@ class Discovery:
                     if (not doi or not isinstance(titles, list) or not titles
                             or any(not isinstance(title, str) or not title.strip() for title in titles)):
                         raise ValueError("Crossref indexed work metadata is invalid")
-                    if doi in seen_dois or doi in page_dois:
+                    if doi in state["seen_dois"] or doi in page_dois:
                         raise ValueError("Crossref repeated DOI during a query")
                     page_dois.append(doi)
-                seen_dois.update(page_dois)
-                entry = {"route": route, "request_id": rid, "page": page, "reported_total": total,
-                         "returned": len(rows), "offset": offset, "status": "page_validated"}
-                self.coverage.append(entry)
+                state["seen_dois"].update(page_dois)
+                next_offset = offset + len(rows)
+                done = next_offset >= total
+                page_entry = {"request_id": rid, "page": page, "reported_total": total,
+                              "returned": len(rows), "offset": offset, "status": "page_validated"}
+                self.pages += 1
+                audit["pages_validated"] += 1
+                audit["reported_total"] = total
+                audit["returned"] += len(rows)
+                audit["pages"].append(page_entry)
+                state.update(total=total, offset=next_offset, done=done)
+                if done:
+                    state["done"] = True
+                    audit["status"] = "zero_hit" if total == 0 else "api_reported_end"
+                    audit["reason"] = None
+                else:
+                    audit["status"] = "partial"
+                    audit["reason"] = "more_pages_available"
                 for row in rows:
                     yield row, rid
-                offset += len(rows)
-                if offset >= total:
-                    entry["status"] = "api_reported_end"
+                if done:
                     return
                 nxt = message.get("next-cursor")
-                if not isinstance(nxt, str) or not nxt or len(nxt) > 4096 or nxt == cursor or nxt in seen_cursors:
+                if (not isinstance(nxt, str) or not nxt or len(nxt) > 4096
+                        or nxt == cursor or nxt in state["seen_cursors"]):
                     raise ValueError("Crossref missing or cyclic cursor")
-                seen_cursors.add(cursor)
-                cursor = nxt
-                page += 1
+                state["seen_cursors"].add(cursor)
+                state["cursor"] = nxt
+                state["page"] = page + 1
+                if one_page:
+                    return
             except BudgetStop:
                 raise
             except (ValueError, TypeError) as exc:
                 self.errors.append({"request_id": rid, "route": route, "error_type": type(exc).__name__,
                                     "reason": "malformed_or_repeated_page"})
+                self._fail_coverage(route, "malformed_or_repeated_page")
+                state["done"] = True
                 raise
 
-    def run(self) -> dict:
-        queue = deque()
-        visited = set()
-        stopped = False
-        for query in self.plan["queries"]:
-            route = {"kind": "query", "provider": "europepmc", "query": query}
+    def _run_task_page(self, task: dict) -> None:
+        route, action = task["route"], task["action"]
+        key = self._route_key(route)
+        self._coverage_for(route)
+        try:
+            if task.get("provider") == "crossref":
+                stream = self._crossref_search_pages(task["query"], route, one_page=True)
+            elif action in {"query", "resolve"}:
+                query = task["query"]
+                if action == "resolve":
+                    query = f'DOI:"{task["doi"]}"'
+                stream = self._pages("search", route, query=query, one_page=True)
+            else:
+                stream = self._pages(task["kind"], route, epmc=task["epmc"], one_page=True)
+            for item, request_id in stream:
+                if action == "resolve":
+                    if _doi(item.get("doi")) != task["doi"]:
+                        self.errors.append({"route": route, "error_type": "ValueError",
+                                            "reason": "doi_resolution_identity_mismatch"})
+                        self._fail_coverage(route, "doi_resolution_identity_mismatch")
+                        self._page_states[key]["done"] = True
+                        continue
+                    self._add(item, route, request_id)
+                    ident = _epmc_id(item.get("source"), item.get("id"))
+                    if ident:
+                        result = {"epmc": ident, "parent": task["parent"], "depth": task["depth"]}
+                        if result not in self._task_results.setdefault(key, []):
+                            self._task_results[key].append(result)
+                elif action == "citation":
+                    child, _ = self._add(item, route, request_id)
+                    if not child:
+                        continue
+                    kind = task["kind"]
+                    parent = self._canonical(task["parent"])
+                    self.edges.append({"from": parent if kind == "references" else child,
+                        "to": child if kind == "references" else parent, "kind": "references",
+                        "discovery_direction": kind, "provider": "europepmc", "request_id": request_id,
+                        "depth": task["depth"]})
+                    ident = _epmc_id(item.get("source"), item.get("id"))
+                    child_seed = ({"source": ident[0], "id": ident[1]} if ident
+                                  else {"doi": _doi(item.get("doi"))})
+                    result = {"seed": child_seed, "parent": child, "depth": task["depth"]}
+                    if result not in self._task_results.setdefault(key, []):
+                        self._task_results[key].append(result)
+                else:
+                    self._add(item, route, request_id)
+        except BudgetStop:
+            raise
+        except Exception as exc:
+            # Keep the route-specific failure without exposing exception text.
+            self._fail_coverage(route, "route_execution_failure")
+            if not any(row.get("route") == route for row in self.errors):
+                self.errors.append({"route": route, "error_type": type(exc).__name__,
+                                    "reason": "route_execution_failure"})
+
+    def _run_scheduled(self, tasks: list[dict], *, first_round_only: bool = False,
+                       reserve_pages: int = 0) -> bool:
+        """Give every route one page before fairly sharing continuation pages.
+
+        ``first_round_only`` lets the caller introduce newly discovered seed
+        routes before any keyword route receives its second page.
+        """
+        unique: list[dict] = []
+        seen = set()
+        for task in tasks:
+            key = self._route_key(task["route"])
+            self._coverage_for(task["route"])
+            if key not in seen:
+                seen.add(key)
+                unique.append(task)
+        for task in unique:
+            key = self._route_key(task["route"])
+            if key in self._page_states:
+                continue
+            if (first_round_only and reserve_pages
+                    and (self.pages >= self.budgets.pages - reserve_pages
+                         or len(self.requests) >= self.budgets.requests - reserve_pages)):
+                # Keep a deterministic slice of the budget for seed fallback
+                # or newly unlocked citations; these routes will rejoin the
+                # same round-robin below.
+                return False
             try:
-                for item, rid in self._pages("search", route, query=query):
-                    self._add(item, route, rid)
+                self._run_task_page(task)
+            except BudgetStop:
+                return True
+        if first_round_only:
+            return False
+        while True:
+            active = [task for task in unique
+                      if not self._page_states.get(self._route_key(task["route"]), {}).get("done", False)]
+            if not active:
+                return False
+            for task in active:
+                if self.pages >= self.budgets.pages:
+                    try:
+                        self._stop("page_budget", task["route"])
+                    except BudgetStop:
+                        return True
+                try:
+                    self._run_task_page(task)
+                except BudgetStop:
+                    return True
+
+    def run(self) -> dict:
+        stopped = False
+        seed_by_key: dict[str, dict] = {}
+        seed_task_rows: dict[str, dict] = {}
+        user_alias_tasks: list[dict] = []
+        seed_tasks: list[dict] = []
+        source_tasks: list[dict] = []
+        term_tasks: list[dict] = []
+
+        def citation_task(seed: dict, parent: str, depth: int, epmc: tuple[str, str], kind: str,
+                          route: dict | None = None) -> dict:
+            direction = "backward" if kind == "references" else "forward"
+            route = route or {"kind": kind, "provider": "europepmc", "seed": seed,
+                              "direction": direction, "depth": depth}
+            return {"action": "citation", "provider": "europepmc", "route": route,
+                    "kind": kind, "epmc": epmc, "parent": parent, "depth": depth}
+
+        def audit_seed(seed: dict, parent: str) -> dict:
+            resolve_route = None
+            if "doi" in seed:
+                resolve_route = {"kind": "resolve_doi", "provider": "europepmc", "seed": seed,
+                                 "doi": seed["doi"]}
+            backward_route = {"kind": "references", "provider": "europepmc", "seed": seed,
+                              "direction": "backward", "depth": 1}
+            forward_route = {"kind": "citations", "provider": "europepmc", "seed": seed,
+                             "direction": "forward", "depth": 1}
+            row = {"seed": seed, "registration": {"status": "pending"},
+                   "doi_resolution": {"status": "not_required" if resolve_route is None else "unattempted",
+                                      "route": resolve_route},
+                   "backward_citations": {"status": "unattempted", "route": backward_route},
+                   "forward_citations": {"status": "unattempted", "route": forward_route}}
+            self.seed_routes.append(row)
+            if resolve_route is not None:
+                self._coverage_for(resolve_route)
+            self._coverage_for(backward_route)
+            self._coverage_for(forward_route)
+            seed_task_rows[self._route_key(seed)] = row
+            return row
+
+        # Pre-register every seed's independent audit routes before any record or
+        # network budget can stop work; then add seed observations before searches.
+        for seed in self.plan["seeds"]:
+            audit_seed(seed, "")
+        for seed in self.plan["seeds"]:
+            registration_route = {"kind": "seed"}
+            self._coverage_for(registration_route)
+            seed_row = seed_task_rows[self._route_key(seed)]
+            try:
+                parent, _ = self._add(seed, registration_route, None)
             except BudgetStop:
                 stopped = True
+                self._coverage_for(registration_route).update(status="budget_truncated", reason="record_budget")
                 break
-            except Exception:
-                continue
-        if not stopped:
+            seed_row["registration"] = {"status": "registered"}
+            seed_by_key[self._route_key(seed)] = {"seed": seed, "parent": parent or "", "depth": 0}
+            epmc = _epmc_id(seed.get("source"), seed.get("id"))
+            if epmc and self.budgets.depth == 0:
+                for field in ("backward_citations", "forward_citations"):
+                    self._coverage_for(seed_row[field]["route"]).update(
+                        status="budget_truncated", reason="depth_budget")
+            elif epmc:
+                for kind, field in (("references", "backward_citations"), ("citations", "forward_citations")):
+                    route = seed_row[field]["route"]
+                    seed_tasks.append(citation_task(seed, parent or "", 1, epmc, kind, route))
+            else:
+                route = seed_row["doi_resolution"]["route"]
+                seed_tasks.append({"action": "resolve", "provider": "europepmc", "route": route,
+                    "query": f'DOI:"{seed["doi"]}"', "doi": seed["doi"], "parent": parent or "", "depth": 0})
+
+        sources = self.plan["sources"]
+        for alias in self.plan["aliases"]:
+            if "europepmc" in sources:
+                query = f'TITLE_ABS:"{alias}"'
+                user_alias_tasks.append({"action": "query", "provider": "europepmc", "query": query,
+                    "route": {"kind": "query", "provider": "europepmc", "query": query,
+                             "route_class": "user_alias"}})
+            if "crossref" in sources and alias in self.plan["crossref_queries"]:
+                user_alias_tasks.append({"action": "query", "provider": "crossref", "query": alias,
+                    "route": {"kind": "query", "provider": "crossref", "query": alias,
+                             "route_class": "user_alias"}})
+        if "europepmc" in sources and self.plan["queries"]:
+            query = self.plan["queries"][0]
+            source_tasks.append({"action": "query", "provider": "europepmc", "query": query,
+                "route": {"kind": "query", "provider": "europepmc", "query": query,
+                         "route_class": "source_baseline"}})
+            for query in self.plan["queries"][1:]:
+                term_tasks.append({"action": "query", "provider": "europepmc", "query": query,
+                    "route": {"kind": "query", "provider": "europepmc", "query": query,
+                             "route_class": "topic_terms"}})
+        if "crossref" in sources:
+            alias_set = set(self.plan["aliases"])
             for query in self.plan["crossref_queries"]:
-                route = {"kind": "query", "provider": "crossref", "query": query}
-                try:
-                    for item, rid in self._crossref_search_pages(query, route):
-                        self._add(item, route, rid)
-                except BudgetStop:
-                    stopped = True
-                    break
-                except Exception:
-                    continue
+                if query not in alias_set:
+                    term_tasks.append({"action": "query", "provider": "crossref", "query": query,
+                        "route": {"kind": "query", "provider": "crossref", "query": query,
+                                 "route_class": "topic_terms"}})
+
+        citation_tasks: list[dict] = []
+        discovered: list[dict] = []
+        crossref_fallback_done: set[str] = set()
+
+        def crossref_seed_fallback(seed: dict, row: dict, parent: str) -> bool:
+            """Use Crossref only after DOI resolution completes without an identity."""
+            seed_key = self._route_key(seed)
+            if seed_key in crossref_fallback_done:
+                return False
+            crossref_fallback_done.add(seed_key)
+            backward_epmc = row["backward_citations"]["route"]
+            forward_epmc = row["forward_citations"]["route"]
+            self._coverage_for(backward_epmc).update(status="unavailable", reason="no_europepmc_identity")
+            self._coverage_for(forward_epmc).update(
+                status="unavailable", reason="crossref_has_no_forward_endpoint")
+            crossref_route = {"kind": "references", "provider": "crossref", "parent": parent,
+                              "seed": seed, "direction": "backward", "depth": 1}
+            try:
+                refs = self._crossref(seed["doi"], parent, 1, seed)
+                row["backward_citations"] = {"status": self._coverage_for(crossref_route)["status"],
+                                             "route": crossref_route}
+                row["forward_citations"] = {"status": "unavailable",
+                                            "reason": "crossref_has_no_forward_endpoint",
+                                            "route": forward_epmc}
+                discovered.extend({"seed": child, "parent": child_id, "depth": 1}
+                                  for child, child_id in refs)
+            except BudgetStop:
+                return True
+            except Exception as exc:
+                self._fail_coverage(crossref_route, "route_execution_failure")
+                row["backward_citations"] = {"status": self._coverage_for(crossref_route)["status"],
+                                             "route": crossref_route}
+                row["forward_citations"] = {"status": "unavailable",
+                                            "reason": "crossref_has_no_forward_endpoint",
+                                            "route": forward_epmc}
+                self.errors.append({"route": crossref_route, "error_type": type(exc).__name__,
+                                    "reason": "route_execution_failure"})
+            return False
+
+        first_pass = self._interleave([user_alias_tasks, seed_tasks, source_tasks, term_tasks])
+        for task in first_pass:
+            self._coverage_for(task["route"])
+        if stopped:
+            for task in first_pass:
+                audit = self._coverage_for(task["route"])
+                audit.update(status="budget_truncated", reason="record_budget")
+            for row in self.seed_routes:
+                if row["registration"]["status"] == "pending":
+                    row["registration"] = {"status": "budget_truncated", "reason": "record_budget"}
+                for field in ("doi_resolution", "backward_citations", "forward_citations"):
+                    route = row[field].get("route")
+                    if route:
+                        self._coverage_for(route).update(status="budget_truncated", reason="record_budget")
+        else:
+            # Spend one fair first page per route, then let explicit DOI seeds
+            # add their fallback/citation work before broad-query continuations.
+            doi_seeds = (sum("doi" in seed for seed in self.plan["seeds"])
+                         if self.budgets.depth > 0 else 0)
+            available = min(self.budgets.pages, self.budgets.requests)
+            reserve = min(2 * doi_seeds, max(0, available - 1))
+            stopped = self._run_scheduled(first_pass, first_round_only=True,
+                                          reserve_pages=reserve) or stopped
+
+        # Resolve explicit DOI seeds to Europe PMC before attempting their two
+        # citation directions. Crossref is a bounded backward-reference fallback.
         if not stopped:
             for seed in self.plan["seeds"]:
-                try:
-                    cid, _ = self._add(seed, {"kind": "seed"}, None)
-                    queue.append((seed, cid, 0))
-                except BudgetStop:
-                    stopped = True
-                    break
-        while queue and not stopped:
-            seed, parent, depth = queue.popleft()
-            parent = self._canonical(parent)
-            key = json.dumps(seed, sort_keys=True)
-            if key in visited:
-                continue
-            visited.add(key)
-            if depth >= self.budgets.depth:
-                self.truncations.append({"reason": "depth_budget", "route": {"seed": seed, "depth": depth}})
-                continue
-            epmc = _epmc_id(seed.get("source"), seed.get("id"))
-            try:
-                if not epmc:
-                    doi = seed["doi"]
-                    route = {"kind": "resolve_doi", "provider": "europepmc", "doi": doi}
-                    resolved = []
-                    for row, rid in self._pages("search", route, query=f'DOI:"{doi}"'):
-                        # Do not allow a search service to silently substitute another DOI.
-                        if _doi(row.get("doi")) != doi:
-                            raise ValueError("DOI resolution identity mismatch")
-                        self._add(row, route, rid)
-                        ident = _epmc_id(row.get("source"), row.get("id"))
-                        if ident and ident not in resolved:
-                            resolved.append(ident)
-                    if resolved:
-                        epmc = resolved[0]
-                        for other in resolved[1:]:
-                            queue.append(({"source": other[0], "id": other[1]}, parent, depth))
-                    else:
-                        for child, child_id in self._crossref(doi, parent, depth + 1):
-                            queue.append((child, child_id, depth + 1))
-                        self.coverage.append({"route": route, "status": "forward_citations_unavailable"})
-                        continue
-                epmc_key = f"epmc:{epmc[0]}:{epmc[1]}"
-                if epmc_key in visited:
+                if "doi" not in seed:
                     continue
-                visited.add(epmc_key)
-                for kind in ("references", "citations"):
-                    route = {"kind": kind, "provider": "europepmc", "parent": parent, "depth": depth + 1}
-                    try:
-                        for row, rid in self._pages(kind, route, epmc=epmc):
-                            child, _ = self._add(row, route, rid)
-                            if child:
-                                self.edges.append({"from": parent if kind == "references" else child,
-                                    "to": child if kind == "references" else parent, "kind": "references",
-                                    "discovery_direction": kind, "provider": "europepmc", "request_id": rid,
-                                    "depth": depth + 1})
-                                ident = _epmc_id(row.get("source"), row.get("id"))
-                                child_seed = {"source": ident[0], "id": ident[1]} if ident else {"doi": _doi(row.get("doi"))}
-                                queue.append((child_seed, child, depth + 1))
-                    except BudgetStop:
-                        raise
-                    except Exception:
+                row = seed_task_rows[self._route_key(seed)]
+                resolve_route = row["doi_resolution"]["route"]
+                resolved = self._task_results.get(self._route_key(resolve_route), [])
+                parent = self._canonical(seed_by_key[self._route_key(seed)]["parent"]) or seed_by_key[self._route_key(seed)]["parent"]
+                if resolved and self.budgets.depth > 0:
+                    for result in resolved:
+                        epmc = result["epmc"]
+                        for kind, field in (("references", "backward_citations"), ("citations", "forward_citations")):
+                            route = row[field]["route"]
+                            citation_tasks.append(citation_task(seed, parent, 1, epmc, kind, route))
+                elif self.budgets.depth == 0:
+                    for field in ("backward_citations", "forward_citations"):
+                        route = row[field]["route"]
+                        self._coverage_for(route).update(status="budget_truncated", reason="depth_budget")
+                else:
+                    resolve_state = self._page_states.get(self._route_key(resolve_route))
+                    # An unattempted or paginating resolver is not evidence
+                    # that Europe PMC lacks an identity; let it finish first.
+                    if resolve_state is not None and resolve_state["done"]:
+                        stopped = crossref_seed_fallback(seed, row, parent) or stopped
+                        if stopped:
+                            break
+            if not stopped:
+                # Existing active keyword/DOI routes and newly unlocked seed
+                # citations share the same continuation round-robin.
+                scheduled_routes = self._interleave(
+                    [user_alias_tasks, citation_tasks, seed_tasks, source_tasks, term_tasks])
+                stopped = self._run_scheduled(scheduled_routes)
+
+                # A DOI resolver that was still active during the first
+                # round may now have reached a terminal zero-hit/failure
+                # state. Only then may its explicit Crossref fallback run.
+                if not stopped and self.budgets.depth > 0:
+                    for seed in self.plan["seeds"]:
+                        if "doi" not in seed:
+                            continue
+                        row = seed_task_rows[self._route_key(seed)]
+                        resolve_route = row["doi_resolution"]["route"]
+                        if self._task_results.get(self._route_key(resolve_route)):
+                            continue
+                        resolve_state = self._page_states.get(self._route_key(resolve_route))
+                        if resolve_state is not None and resolve_state["done"]:
+                            parent = self._canonical(seed_by_key[self._route_key(seed)]["parent"])
+                            stopped = crossref_seed_fallback(seed, row, parent) or stopped
+                            if stopped:
+                                break
+
+                # A paginated DOI resolver may find its exact identity only on
+                # a continuation page. Add its citation routes without
+                # allowing those pages to be hidden behind all keyword pages.
+                scheduled = {self._route_key(task["route"]) for task in citation_tasks}
+                for seed in self.plan["seeds"]:
+                    if "doi" not in seed:
                         continue
-            except BudgetStop:
-                stopped = True
-            except Exception as exc:
-                self.errors.append({"route": {"kind": "citation_expansion", "seed": seed},
-                                    "error_type": type(exc).__name__, "reason": "expansion_failure"})
+                    row = seed_task_rows[self._route_key(seed)]
+                    resolved = self._task_results.get(self._route_key(row["doi_resolution"]["route"]), [])
+                    if not resolved or self.budgets.depth == 0:
+                        continue
+                    parent = self._canonical(seed_by_key[self._route_key(seed)]["parent"])
+                    for result in resolved:
+                        for kind, field in (("references", "backward_citations"), ("citations", "forward_citations")):
+                            route = row[field]["route"]
+                            key = self._route_key(route)
+                            if key not in scheduled:
+                                citation_tasks.append(citation_task(seed, parent, 1, result["epmc"], kind, route))
+                                scheduled.add(key)
+                if not stopped and citation_tasks:
+                    scheduled_routes = self._interleave(
+                        [user_alias_tasks, citation_tasks, seed_tasks, source_tasks, term_tasks])
+                    stopped = self._run_scheduled(scheduled_routes)
+
+        for task in [*seed_tasks, *citation_tasks]:
+            if task.get("action") == "citation":
+                discovered.extend(self._task_results.get(self._route_key(task["route"]), []))
+
+        # Expand newly discovered citation neighbors breadth-first. Every level
+        # still gives backward and forward routes a first page before continuations.
+        visited = {self._route_key(seed) for seed in self.plan["seeds"]}
+        frontier = discovered
+        while frontier and not stopped:
+            next_frontier: list[dict] = []
+            level_tasks: list[dict] = []
+            doi_tasks: list[dict] = []
+            for node in frontier:
+                seed = node["seed"]
+                node_key = self._route_key(seed)
+                if node_key in visited:
+                    continue
+                visited.add(node_key)
+                depth = node["depth"]
+                if depth >= self.budgets.depth:
+                    self.truncations.append({"reason": "depth_budget", "route": {"seed": seed, "depth": depth}})
+                    continue
+                parent = self._canonical(node["parent"]) or node["parent"]
+                epmc = _epmc_id(seed.get("source"), seed.get("id"))
+                if epmc:
+                    for kind in ("references", "citations"):
+                        direction = "backward" if kind == "references" else "forward"
+                        route = {"kind": kind, "provider": "europepmc", "seed": seed,
+                                 "direction": direction, "depth": depth + 1}
+                        task = citation_task(seed, parent, depth + 1, epmc, kind, route)
+                        level_tasks.append(task)
+                else:
+                    doi = seed.get("doi", "")
+                    route = {"kind": "resolve_doi", "provider": "europepmc", "seed": seed, "doi": doi}
+                    task = {"action": "resolve", "provider": "europepmc", "route": route,
+                            "query": f'DOI:"{doi}"', "doi": doi, "parent": parent, "depth": depth}
+                    doi_tasks.append(task)
+            if doi_tasks:
+                stopped = self._run_scheduled(self._interleave([doi_tasks]))
+                if stopped:
+                    break
+                for task in doi_tasks:
+                    route = task["route"]
+                    for result in self._task_results.get(self._route_key(route), []):
+                        seed = {"source": result["epmc"][0], "id": result["epmc"][1]}
+                        parent = result["parent"]
+                        for kind in ("references", "citations"):
+                            direction = "backward" if kind == "references" else "forward"
+                            cite_route = {"kind": kind, "provider": "europepmc", "seed": seed,
+                                          "direction": direction, "depth": task["depth"] + 1}
+                            cite_task = citation_task(seed, parent, task["depth"] + 1,
+                                                       result["epmc"], kind, cite_route)
+                            level_tasks.append(cite_task)
+                    if not self._task_results.get(self._route_key(route)):
+                        parent = task["parent"]
+                        doi = task["doi"]
+                        crossref_route = {"kind": "references", "provider": "crossref", "parent": parent,
+                                          "seed": task["route"]["seed"], "direction": "backward",
+                                          "depth": task["depth"] + 1}
+                        try:
+                            refs = self._crossref(doi, parent, task["depth"] + 1,
+                                                  task["route"].get("seed"))
+                            next_frontier.extend({"seed": child, "parent": child_id,
+                                                  "depth": task["depth"] + 1} for child, child_id in refs)
+                        except BudgetStop:
+                            stopped = True
+                            break
+                        except Exception as exc:
+                            self._fail_coverage(crossref_route, "route_execution_failure")
+                            self.errors.append({"route": crossref_route, "error_type": type(exc).__name__,
+                                                "reason": "route_execution_failure"})
+            if stopped:
+                break
+            if level_tasks:
+                stopped = self._run_scheduled(self._interleave([level_tasks]))
+                for task in level_tasks:
+                    next_frontier.extend(self._task_results.get(self._route_key(task["route"]), []))
+            frontier = next_frontier
+
+        # Seed route summaries mirror the route-level audit without conflating
+        # DOI lookup, backward references, and forward citations.
+        for row in self.seed_routes:
+            for field in ("doi_resolution", "backward_citations", "forward_citations"):
+                detail = row[field]
+                route = detail.get("route")
+                if route:
+                    coverage = self._coverage_for(route)
+                    detail["status"] = coverage["status"]
+                    if coverage.get("reason"):
+                        detail["reason"] = coverage["reason"]
+        if stopped and self.truncations:
+            stop_reason = self.truncations[-1]["reason"]
+            for audit in self.coverage:
+                if audit["status"] == "unattempted":
+                    # Preserve the semantic distinction between work never
+                    # attempted and a route that began but was cut mid-stream.
+                    audit["reason"] = stop_reason
         # Bridge observations can unify two stable IDs while their work is queued.
         # Resolve every graph/provenance parent only after all unions have settled.
         for edge in self.edges:
@@ -674,13 +1167,15 @@ class Discovery:
         for row in self.unresolved + self.coverage + self.errors + self.truncations + self.requests:
             if "parent" in row.get("route", {}):
                 row["route"]["parent"] = self._canonical(row["route"]["parent"])
-        return {"schema_version": 1, "topic_fingerprint": self.plan["topic_fingerprint"],
+        return {"schema_version": 2, "topic_fingerprint": self.plan["topic_fingerprint"],
                 "status": "partial" if self.errors or self.truncations else "bounded_retrieval_finished",
                 "candidate_status": "unreviewed", "approval": None, "exhaustive_recall": False,
-                "counts": {"requests": len(self.requests), "pages": self.pages, "observations": self.observations,
+                "counts": {"requests": len(self.requests), "page_attempts": self.page_attempts,
+                           "pages": self.pages, "observations": self.observations,
                            "candidates": len(self.candidates), "unresolved": len(self.unresolved), "edges": len(self.edges)},
                 "candidates": self.candidates, "unresolved_references": self.unresolved, "edges": self.edges,
-                "coverage": self.coverage, "errors": self.errors, "truncations": self.truncations,
+                "coverage": self.coverage, "seed_routes": self.seed_routes,
+                "errors": self.errors, "truncations": self.truncations,
                 "identity_redirects": self.identity_redirects}
 
 
@@ -705,7 +1200,7 @@ def execute(plan: dict, out_dir: Path, *, online: bool = False, client: Any | No
     out_dir.mkdir(parents=True, exist_ok=True)
     _write_json(out_dir / "plan.json", plan)
     if not online and replay_dir is None:
-        report = {"schema_version": 1, "status": "offline_plan", "topic_fingerprint": plan["topic_fingerprint"],
+        report = {"schema_version": 2, "status": "offline_plan", "topic_fingerprint": plan["topic_fingerprint"],
                   "network_requests": 0, "candidate_status": "unreviewed", "approval": None,
                   "exhaustive_recall": False}
     else:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -14,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from litsearch.document_parse import (Options, ParseError, _continuations, _ocr_image,
+                                      _merge_pdf_wrapped_rows, _pdf_column_gutter,
                                       _stop_tree, main, parse_bounded,
                                       parse_document, parse_tsv, selected_pages)
 
@@ -207,6 +209,31 @@ class DocumentParseTests(unittest.TestCase):
         self.assertFalse(second["continuation"]["merged"])
         self.assertEqual(second["raw_matrix"], [["X", None]])
         self.assertNotIn("continuation", third)
+
+    def test_pdf_wrapped_row_requires_multiple_alignment_and_text_clues(self):
+        def row_cells(row, values, top):
+            return [{"id": f"c{row}-{column}", "row": row, "column": column,
+                     "bbox": [column * 100, top, (column + 1) * 100, top + 10],
+                     "raw_text": value, "raw_characters": []}
+                    for column, value in enumerate(values)]
+        wrapped = {"id": "table-wrapped",
+                   "raw_matrix": [["E. coli", "Escherichia coli sub sp. ATCC9637", "Laboratory"],
+                                  ["ATCC9637", "", "stored"]],
+                   "cells": row_cells(0, ["E. coli", "Escherichia coli sub sp. ATCC9637", "Laboratory"], 10)
+                            + row_cells(1, ["ATCC9637", "", "stored"], 20),
+                   "grid": []}
+        _merge_pdf_wrapped_rows(wrapped)
+        self.assertEqual(wrapped["raw_matrix"], [["E. coli\nATCC9637",
+                                                  "Escherichia coli sub sp. ATCC9637",
+                                                  "Laboratory\nstored"]])
+
+        sparse = {"id": "table-sparse",
+                  "raw_matrix": [["Strains", "Count", "Source"], ["", "2", "y"]],
+                  "cells": row_cells(0, ["Strains", "Count", "Source"], 10)
+                           + row_cells(1, ["", "2", "y"], 20),
+                  "grid": []}
+        _merge_pdf_wrapped_rows(sparse)
+        self.assertEqual(sparse["raw_matrix"], [["Strains", "Count", "Source"], ["", "2", "y"]])
 
     def test_tsv_invalid_boxes_and_header(self):
         with self.assertRaises(ParseError):
@@ -505,6 +532,195 @@ class SyntheticPDFTests(unittest.TestCase):
         self.assertEqual(merged["raw_text"], "Merged (g/L)")
         self.assertEqual(table["grid"][0][0], table["grid"][0][1])
         self.assertIsNone(table["raw_matrix"][0][1])
+
+    def test_unruled_table_is_extracted_with_local_caption_and_without_body_text(self):
+        from reportlab.pdfgen import canvas
+        path = self.root / "unruled.pdf"
+        doc = canvas.Canvas(str(path), pagesize=(360, 360))
+        doc.drawString(30, 320, "Table 1 Strains used in this study")
+        for y, values in ((290, ("Strain", "Characteristics", "Source")),
+                          (265, ("D-Paol07", "D-Paol06 delta-ldhA", "This study")),
+                          (240, ("D-Paol08", "D-Paol07 delta-mgsA", "This study")),
+                          (215, ("D-Paol09", "D-Paol08 delta-panB", "This study"))):
+            for x, value in zip((30, 130, 280), values):
+                doc.drawString(x, y, value)
+        doc.drawString(30, 190, "2.1 Results")
+        doc.drawString(30, 170, "This body paragraph is not part of the table.")
+        doc.save()
+        result = parse_document(path, Options(table_strategy="text"))
+        self.assertEqual(len(result["tables"]), 1)
+        table = result["tables"][0]
+        self.assertEqual(table["status"], "extracted_pending_review", table)
+        self.assertEqual(max(map(len, table["raw_matrix"])), 3)
+        self.assertIn("D-Paol07", " ".join(str(value) for row in table["raw_matrix"] for value in row))
+        self.assertEqual(table["caption"]["raw_text"], "Table 1 Strains used in this study")
+        self.assertNotIn("body paragraph", " ".join(str(value) for row in table["raw_matrix"] for value in row))
+
+    def test_short_unpunctuated_two_column_prose_is_not_a_table(self):
+        from reportlab.pdfgen import canvas
+        path = self.root / "short-unpunctuated-prose.pdf"
+        doc = canvas.Canvas(str(path), pagesize=(600, 800))
+        left = ("Cells grew in minimal medium", "Samples came from overnight culture",
+                "Biomass increased during incubation", "Cultures stayed below thirty degrees",
+                "Replicates followed the same protocol")
+        right = ("Products formed during the reaction", "Analysis used liquid chromatography",
+                 "Standards covered the measured range", "Controls contained no added substrate",
+                 "Results matched the previous experiment")
+        for index, (left_line, right_line) in enumerate(zip(left, right)):
+            y = 740 - index * 28
+            doc.drawString(40, y, left_line)
+            doc.drawString(325, y, right_line)
+        doc.save()
+        result = parse_document(path, Options(table_strategy="text"))
+        self.assertFalse(any(table["status"] == "extracted_pending_review" for table in result["tables"]),
+                         [(table.get("status"), table.get("failure_reason"))
+                          for table in result["tables"]])
+        self.assertTrue(all(table["extraction_status"] == "not_reliably_extracted"
+                            and table["raw_matrix"] == [] for table in result["tables"]))
+
+    def test_double_column_prose_cannot_be_reported_as_a_reliable_table(self):
+        from reportlab.pdfgen import canvas
+        path = self.root / "two-column-prose.pdf"
+        doc = canvas.Canvas(str(path), pagesize=(600, 800))
+        left = ("Cells grew in minimal medium", "Samples came from overnight culture",
+                "Biomass increased during incubation", "Cultures stayed below thirty degrees",
+                "Replicates followed the same protocol")
+        right = ("Products formed during the reaction", "Analysis used liquid chromatography",
+                 "Standards covered the measured range", "Controls contained no added substrate",
+                 "Results matched the previous experiment")
+        for index, (left_line, right_line) in enumerate(zip(left, right)):
+            y = 740 - index * 28
+            doc.drawString(40, y, left_line)
+            doc.drawString(325, y, right_line)
+        doc.save()
+        result = parse_document(path, Options(table_strategy="text"))
+        self.assertFalse(any(table["status"] == "extracted_pending_review" for table in result["tables"]),
+                         result["tables"])
+        for table in result["tables"]:
+            self.assertEqual(table["status"], "untrusted")
+            self.assertEqual(table["extraction_status"], "not_reliably_extracted")
+            self.assertEqual(table["raw_matrix"], [])
+
+    def test_repeated_single_column_prose_and_table_reference_are_not_tables(self):
+        from reportlab.pdfgen import canvas
+        path = self.root / "repeated-prose.pdf"
+        doc = canvas.Canvas(str(path), pagesize=(600, 800))
+        doc.drawString(40, 760, "Table 1 shows the experiments discussed below.")
+        for index in range(8):
+            doc.drawString(40, 720 - index * 28,
+                           "The repeated sentence describes the measured strain under controlled conditions.")
+        doc.save()
+        result = parse_document(path, Options(table_strategy="text"))
+        self.assertFalse(any(table["status"] == "extracted_pending_review" for table in result["tables"]),
+                         result["tables"])
+        self.assertTrue(all(table["extraction_status"] == "not_reliably_extracted"
+                            for table in result["tables"]))
+
+    def test_wide_heading_does_not_bridge_two_column_gutter(self):
+        import pdfplumber
+        from reportlab.pdfgen import canvas
+        path = self.root / "two-column-heading-bridge.pdf"
+        doc = canvas.Canvas(str(path), pagesize=(900, 800))
+        doc.setFont("Helvetica", 20)
+        doc.drawString(35, 770, "A full-width section heading bridging the page center across both columns")
+        doc.setFont("Helvetica", 10)
+        left = ("The engineered strain was cultivated in minimal medium.",
+                "Samples were collected during exponential growth.",
+                "Cell density was measured using optical absorbance.",
+                "Each experiment was performed in biological triplicate.",
+                "The resulting cultures were stored at low temperature.")
+        right = ("The reaction was analyzed with high-performance liquid chromatography.",
+                 "The mobile phase was maintained at a constant flow rate.",
+                 "A standard curve was generated from authentic compounds.",
+                 "All measurements were corrected with blank controls.",
+                 "Statistical analyses used the reported replicate values.")
+        for index, (left_line, right_line) in enumerate(zip(left, right)):
+            y = 730 - index * 28
+            doc.drawString(40, y, left_line)
+            doc.drawString(500, y, right_line)
+        doc.save()
+        with pdfplumber.open(path) as pdf:
+            self.assertIsNotNone(_pdf_column_gutter(pdf.pages[0]))
+        result = parse_document(path, Options(table_strategy="text"))
+        self.assertFalse(any(table["status"] == "extracted_pending_review" for table in result["tables"]),
+                         [(table.get("status"), table.get("failure_reason"), table.get("bbox"))
+                          for table in result["tables"]])
+
+    def test_short_caption_keeps_all_columns_and_does_not_clip_long_table(self):
+        import pdfplumber
+        from reportlab.pdfgen import canvas
+        path = self.root / "long-unruled-table.pdf"
+        doc = canvas.Canvas(str(path), pagesize=(360, 1000))
+        doc.drawString(30, 970, "Table 1. Long strain screen")
+        rows = [("Strain", "Index", "Description")]
+        rows.extend((f"S{index:02d}", str(index), f"Variant{index:02d}")
+                    for index in range(25))
+        for index, values in enumerate(rows):
+            y = 942 - index * 24
+            for x, value in zip((30, 130, 280), values):
+                doc.drawString(x, y, value)
+        doc.drawString(30, 285, "2.1 Results")
+        doc.save()
+        with pdfplumber.open(path) as pdf:
+            self.assertIsNone(_pdf_column_gutter(pdf.pages[0]), "table column gaps must not masquerade as a gutter")
+        result = parse_document(path, Options(table_strategy="text"))
+        self.assertEqual(len(result["tables"]), 1)
+        table = result["tables"][0]
+        self.assertEqual(table["status"], "extracted_pending_review", table)
+        self.assertEqual(len(table["raw_matrix"]), 26)
+        self.assertTrue(all(len(row) == 3 for row in table["raw_matrix"]))
+        identifiers = [row[0] for row in table["raw_matrix"][1:] if row and row[0]]
+        self.assertEqual(len([value for value in identifiers if str(value).startswith("S")]), 25)
+        self.assertEqual([str(row[1]) for row in table["raw_matrix"][1:]],
+                         [str(index) for index in range(25)])
+        self.assertEqual([str(row[2]) for row in table["raw_matrix"][1:]],
+                         [f"Variant{index:02d}" for index in range(25)])
+        self.assertEqual({cell["span_evidence"] for cell in table["cells"]}, {"text_inferred"})
+
+    @unittest.skipUnless(os.environ.get("LITSEARCH_DPANTHENOL_PDF"),
+                         "Set LITSEARCH_DPANTHENOL_PDF to run the actual page-3 regression")
+    def test_actual_dpanthenol_pdf_page3_table_integrity(self):
+        path = Path(os.environ["LITSEARCH_DPANTHENOL_PDF"])
+        self.assertTrue(path.is_file(), "configured actual PDF does not exist")
+        result = parse_document(path, Options(pages="3", table_strategy="text"))
+        self.assertEqual(result["status"], "extracted_pending_review")
+        self.assertEqual(len(result["tables"]), 1)
+        table = result["tables"][0]
+        self.assertEqual(table["status"], "extracted_pending_review")
+        self.assertEqual(max(map(len, table["raw_matrix"])), 3)
+        self.assertEqual(len(table["raw_matrix"]), 9)  # header + eight strain records
+        self.assertEqual(table["raw_matrix"], [
+            ["Strains", "Characteristics", "Sources"],
+            ["E. coli\nATCC9637", "Escherichia coli sub sp. ATCC9637", "Laboratory\nstored"],
+            ["D-Paol06", "ATCC9637-ΔackA-pta\nΔadhEΔfrdABCDΔtdcDEΔpflBΔpoxB", "This study"],
+            ["D-Paol07", "D-Paol06 ΔldhA", "This study"],
+            ["D-Paol08", "D-Paol07 ΔmgsA::PJ23119-alsSB.subtilis", "This study"],
+            ["D-Paol09", "D-Paol08 ΔykgH_betA::PJ23119-ilvD", "This study"],
+            ["D-Paol10", "D-Paol09 ΔtolR::PJ23119-panB-PJ23119-panE", "This study"],
+            ["D-Paol11", "D-Paol10 ΔfrwC_frwA::PJ23119-thrA*", "This study"],
+            ["D-PAOH", "D-Paol11 pET-28a-MtpanC-\nEfTyrDCS126M(cid:0)N100A(cid:0)E299A", "This study"],
+        ])
+        records = table["raw_matrix"][1:]
+        self.assertTrue(all(len(row) == 3 for row in records))
+        ids = [str(row[0]).strip() for row in records if row and row[0]]
+        expected = ["ATCC9637", "D-Paol06", "D-Paol07", "D-Paol08", "D-Paol09",
+                    "D-Paol10", "D-Paol11", "D-PAOH"]
+        for identifier in expected:
+            self.assertEqual(sum(identifier in value for value in ids), 1, identifier)
+        characteristics = {str(row[0]): str(row[1] or "") for row in records if row and row[0]}
+        for strain, parent in (("D-Paol07", "D-Paol06"), ("D-Paol08", "D-Paol07"),
+                               ("D-Paol09", "D-Paol08"), ("D-Paol10", "D-Paol09")):
+            self.assertTrue(characteristics[strain].startswith(parent + " "), strain)
+        self.assertEqual({row[2] for row in records[1:]}, {"This study"})
+        self.assertEqual({cell["span_evidence"] for cell in table["cells"]}, {"text_inferred"})
+        flattened = " ".join(str(value or "") for row in table["raw_matrix"] for value in row)
+        for contamination in ("P. Zheng", "Antechamber", "The plasmids", "2.2.",
+                              "Metabolic Engineering"):
+            self.assertNotIn(contamination.lower(), flattened.lower())
+        self.assertEqual(table["caption"]["raw_text"], "Table 1\nThe key strains used in this study.")
+        self.assertLess(table["bbox"][2], 300)
+        self.assertEqual(result["source"]["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+        self.assertTrue(result["pages"][0]["native"]["characters"])
 
     @unittest.skipUnless(shutil.which("tesseract"), "Tesseract binary is not installed")
     def test_real_tesseract_on_synthetic_image(self):
