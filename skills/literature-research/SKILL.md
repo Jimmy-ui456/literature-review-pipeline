@@ -18,7 +18,7 @@ Windows 中文日志使用 UTF-8：给子进程设置 PYTHONUTF8=1、PYTHONIOENC
 ## 选择运行模式
 
 - **首次检索**：主 `python -m litsearch` 默认实际联网。明确检索源和数量预算，保存原始记录、去重结果、身份审计、候选表和审阅模板。PubMed/OpenAlex 缺少必要联系方式或凭据时，仅询问缺失配置，不编造；凭据不写入技能或公开仓库。
-- **补漏**：`litsearch.discovery` 默认仅离线计划。用户要求实际检索时加 `--online`，选择别名、种子、来源、深度及请求/页/记录预算。用返回状态区分 offline_plan、complete、partial 和 failed；预算触顶、接口不支持和失败路径均保留。
+- **补漏**：`litsearch.discovery` 默认仅离线计划。用户要求实际检索时加 `--online`，选择别名、种子、来源、深度及请求/页/记录预算。报告状态 offline_plan 是仅计划，bounded_retrieval_finished 是所选预算范围内检索结束，partial 是部分完成；退出 1 的失败可能没有完整报告。预算触顶、接口不支持和失败路径均保留。
 - **离线复审**：主入口用 `--from-json` 读取 Record 格式；不加 `--verify-online`。联网重新核验只有在本次任务要求时启用。离线结果可能因缓存缺失或过期而保持未核验。
 
 每次使用新的输出目录。不要覆盖旧检索、隐藏截断或把退出 0 自动写成全部完成：主程序可能 completed_with_warnings，须查看 run_manifest.json 和 events.jsonl。
