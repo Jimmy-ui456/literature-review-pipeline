@@ -1,0 +1,4 @@
+interface:
+  display_name: "文献检索与补漏"
+  short_description: "按研究问题检索文献、扩展同义词并追踪引用，保留核验记录与候选状态"
+  default_prompt: "使用 $literature-research 检索这个研究主题，去重核验并生成阅读清单，再用种子论文补漏。"

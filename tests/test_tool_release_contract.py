@@ -55,6 +55,11 @@ class ToolReleaseContractTests(unittest.TestCase):
                 files[base + "entry_points.txt"] = entries
         else:
             files["PKG-INFO"] = metadata
+            for skill in ("word-zotero-citations", "literature-research", "paper-data-extraction"):
+                for member in ("SKILL.md", "agents/openai.yaml", "references/workflows.md"):
+                    name = "skills/" + skill + "/" + member
+                    if name != omitted:
+                        files[name] = "synthetic skill resource"
             if entries is not None:
                 files["d_pan_literature_pipeline.egg-info/entry_points.txt"] = entries
         with tempfile.TemporaryDirectory() as temp:
@@ -82,6 +87,10 @@ class ToolReleaseContractTests(unittest.TestCase):
             with self.subTest(module=module):
                 report = self.inspect(omitted=f"litsearch/{module}.py")
                 self.assertIn("required_member_missing", {x["rule"] for x in report["findings"]})
+
+    def test_sdist_cannot_silently_omit_skill_resources(self):
+        report = self.inspect(kind="sdist", omitted="skills/word-zotero-citations/SKILL.md")
+        self.assertIn("required_skill_member_missing", {x["rule"] for x in report["findings"]})
 
     def test_missing_or_wrong_console_command_is_rejected(self):
         for entries in (None, ENTRIES.replace("litsearch.discovery:main", "litsearch.cli:main")):

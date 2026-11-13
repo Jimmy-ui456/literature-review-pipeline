@@ -1,0 +1,4 @@
+interface:
+  display_name: "论文表格与数据提取"
+  short_description: "提取本地论文表格与扫描文字，保留页码、原始值、单位脚注及待核对状态"
+  default_prompt: "使用 $paper-data-extraction 提取这些论文的指定数据表，保留实验条件、单位、脚注和原文位置。"

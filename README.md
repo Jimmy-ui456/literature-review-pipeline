@@ -86,6 +86,8 @@ python -m litsearch --topic pantothenate --source europepmc --out-dir outputs/pa
 
 ## 可选 Zotero 工具
 
+项目提供三个可调用 skill：Word/Zotero 动态引文、文献检索与补漏、论文表格与数据提取。安装与自然语言调用示例见 [SKILLS.md](docs/SKILLS.md)；技能可跨项目复用已安装的底层模块。
+
 支持 Word 动态数字引文：`pip install ".[citations]"` 后，使用 `literature-cite` 扫描、绑定 DOI、生成和校验动态引文域；使用 `literature-cite-word add-citation --document review.docx` 在 Word 光标处打开 Zotero 插入窗口，或用 `refresh` 更新编号与文末列表。需要本机 Zotero 和已安装的 Word 插件；插件命令发送不等于刷新完成。完整调用流程见 [Zotero 动态引文](docs/ZOTERO_DYNAMIC_CITATIONS.md)。
 
 `litsearch_zotero` 是本机辅助扩展，核心包不依赖它。先只查看帮助：

@@ -104,7 +104,9 @@ def archive_allowed(rel: str, kind: str, config: dict) -> bool:
     if rel == root[:-1]: return True
     if not rel.startswith(root): return False
     inner=rel[len(root):]
-    return (inner in {"", ".github", ".github/workflows", "d_pan_literature_pipeline.egg-info", "docs", "examples", "examples/synthetic", "litsearch", "litsearch/profiles", "litsearch_zotero", "scripts", "tests", "tests/extensions", "setup.cfg", "PKG-INFO"} or inner.endswith("/") or re.fullmatch(r"d_pan_literature_pipeline\.egg-info/(PKG-INFO|SOURCES\.txt|dependency_links\.txt|entry_points\.txt|requires\.txt|top_level\.txt)",inner) is not None or allowed(inner,config)[0])
+    return (inner in {"", ".github", ".github/workflows", "d_pan_literature_pipeline.egg-info", "docs", "examples", "examples/synthetic", "litsearch", "litsearch/profiles", "litsearch_zotero", "scripts", "tests", "tests/extensions", "setup.cfg", "PKG-INFO"}
+            or re.fullmatch(r"skills(?:/(?:word-zotero-citations|literature-research|paper-data-extraction)(?:/(?:agents|references))?)?", inner) is not None
+            or inner.endswith("/") or re.fullmatch(r"d_pan_literature_pipeline\.egg-info/(PKG-INFO|SOURCES\.txt|dependency_links\.txt|entry_points\.txt|requires\.txt|top_level\.txt)",inner) is not None or allowed(inner,config)[0])
 def inspect_archive(archive: Path, config: dict) -> dict:
     kind="wheel" if archive.suffix==".whl" else "sdist"; members=archive_members(archive); findings=[]; names=[]
     for name,link in members:
@@ -120,6 +122,12 @@ def inspect_archive(archive: Path, config: dict) -> dict:
     for req in required_modules:
         expected=req if kind=="wheel" else "d_pan_literature_pipeline-3.0.0/"+req
         if expected not in names: findings.append({"path":expected,"rule":"required_member_missing"})
+    if kind == "sdist":
+        for skill in ("word-zotero-citations", "literature-research", "paper-data-extraction"):
+            for member in ("SKILL.md", "agents/openai.yaml", "references/workflows.md"):
+                expected = "d_pan_literature_pipeline-3.0.0/skills/" + skill + "/" + member
+                if expected not in names:
+                    findings.append({"path": expected, "rule": "required_skill_member_missing"})
     metadata_name=(next((n for n in names if n.endswith(".dist-info/METADATA")), None) if kind=="wheel" else "d_pan_literature_pipeline-3.0.0/PKG-INFO")
     try:
         if kind=="wheel":

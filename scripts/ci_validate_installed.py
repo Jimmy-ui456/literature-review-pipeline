@@ -34,7 +34,7 @@ def main() -> int:
     env["PYTHONUTF8"] = "1"
     with tempfile.TemporaryDirectory(prefix="litsearch-ci-") as temporary:
         fixture = Path(temporary)
-        for name in ("tests", "scripts", "examples"):
+        for name in ("tests", "scripts", "examples", "skills"):
             shutil.copytree(fixture_source / name, fixture / name)
         shutil.copy2(fixture_source / "release_allowlist.json", fixture / "release_allowlist.json")
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Word 与 Zotero 动态引文"
+  short_description: "转换、插入并刷新 Word 中的 Zotero 动态引文，核对数字编号与文末条目"
+  default_prompt: "使用 $word-zotero-citations 处理这份 Word 综述的动态引用，并核验正文编号与文末文献对应。"
