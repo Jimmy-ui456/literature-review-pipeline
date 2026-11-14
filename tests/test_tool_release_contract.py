@@ -14,7 +14,7 @@ from scripts.release_check import inspect_archive, load_config
 ROOT = Path(__file__).resolve().parents[1]
 MODULES = (
     "litsearch/__init__.py", "litsearch/cli.py", "litsearch/core.py",
-    "litsearch/service_probe.py", "litsearch/discovery.py", "litsearch/document_parse.py",
+    "litsearch/service_probe.py", "litsearch/discovery.py", "litsearch/discovery_bridge.py", "litsearch/document_parse.py",
     "litsearch_zotero/__init__.py", "litsearch_zotero/attach_pdfs.py",
     "litsearch_zotero/dynamic_citations.py", "litsearch_zotero/word_plugin.py",
 )
@@ -83,7 +83,7 @@ class ToolReleaseContractTests(unittest.TestCase):
                 self.assertEqual(self.inspect(kind=kind)["result"], "pass")
 
     def test_each_missing_tool_module_is_rejected(self):
-        for module in ("service_probe", "discovery", "document_parse"):
+        for module in ("service_probe", "discovery", "discovery_bridge", "document_parse"):
             with self.subTest(module=module):
                 report = self.inspect(omitted=f"litsearch/{module}.py")
                 self.assertIn("required_member_missing", {x["rule"] for x in report["findings"]})

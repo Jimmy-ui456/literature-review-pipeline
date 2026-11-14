@@ -536,7 +536,60 @@ def convert(plan: dict, output: Path, *, replace_bibliography: bool = False) -> 
     return report
 
 
+def _main_field_coverage(root) -> dict:
+    """Describe unverified citation candidates without treating numbers as citations.
+
+    Numbers in square brackets can also be array indexes or instrument labels.
+    They do not invalidate known Zotero field mappings, but need classification
+    before anybody can make a whole-document citation-coverage claim.
+    """
+    outside, depth = {}, 0
+    for el in root.iter():
+        paragraph = next(el.iterancestors(f"{{{W}}}p"), None)
+        if el.tag == f"{{{W}}}fldChar":
+            kind = el.get(f"{{{W}}}fldCharType")
+            if kind == "begin":
+                depth += 1
+            elif kind == "end":
+                depth = max(0, depth - 1)
+            if paragraph is not None:
+                outside.setdefault(paragraph, []).append("\n")
+        elif el.tag == f"{{{W}}}fldSimple":
+            if paragraph is not None:
+                outside.setdefault(paragraph, []).append("\n")
+        elif el.tag == f"{{{W}}}t" and not depth and paragraph is not None:
+            if not any(p.tag == f"{{{W}}}fldSimple" for p in el.iterancestors()):
+                outside.setdefault(paragraph, []).append(el.text or "")
+    candidates = []
+    paragraphs = root.xpath("//w:p", namespaces=NS)
+    for index, paragraph in enumerate(paragraphs):
+        for match in BRACKETS.finditer("".join(outside.get(paragraph, []))):
+            try:
+                numbers = numeric_refs(match[0])
+                valid = True
+            except ValueError:
+                numbers, valid = [], False
+            if numbers or not valid:
+                candidates.append({"paragraph": index, "display": match[0],
+                                   "numbers": numbers, "syntax_valid": valid})
+    codes = "".join(root.xpath("//w:instrText/text()|//w:fldSimple/@w:instr", namespaces=NS))
+    warnings = ["static_numeric_candidates_need_classification"] if candidates else []
+    if "EN.CITE" in codes:
+        warnings.append("endnote_fields_outside_zotero_scope")
+    return {"verification_scope": "main_document_zotero_fields",
+            "candidate_static_numbers": candidates, "coverage_warnings": warnings,
+            "auxiliary_citation_parts": [], "auxiliary_parts_checked": False,
+            "whole_document_coverage_verified": False}
+
+
 def _verify_root(root) -> dict:
+    """Verify recognized main-document Zotero fields, not all possible citations.
+
+    numeric_correspondence_verified describes the recognized dynamic fields'
+    DOI/number/bibliography mapping. It is not a whole-document completeness
+    assertion. Non-numeric citation styles may be structurally valid while
+    their numeric correspondence is necessarily unverified.
+    """
     fields, stack, citations, bibliographies, errors = [], [], [], [], []
     if root.xpath("//w:fldSimple[contains(@w:instr, 'ZOTERO_')]", namespaces=NS):
         errors.append("unsupported_simple_zotero_fields")
@@ -633,6 +686,10 @@ def _verify_root(root) -> dict:
             except ValueError:
                 errors.append("invalid_bibliography_json")
             bibliographies.append(f["display"])
+        elif re.match(r"ADDIN\s+ZOTERO_", code, flags=re.I):
+            # A valid subset cannot establish a document-level correspondence
+            # while a second Zotero field is truncated or uses an unknown type.
+            errors.append("unsupported_or_malformed_zotero_field")
     if not citations:
         errors.append("no_zotero_citations")
     if len(bibliographies) != 1:
@@ -667,7 +724,7 @@ def _verify_root(root) -> dict:
             errors.append("citation_cluster_bibliography_mismatch")
     complete = (not pending and bool(used_numbers) and len(numeric_groups) == len(citations)
                 and set(bib_map) == used_numbers and len(used_numbers) == len(uris))
-    return {"citation_groups": len(citations),
+    return {**_main_field_coverage(root), "citation_groups": len(citations),
             "unique_references": len(uris), "bibliography_fields": len(bibliographies), "errors": errors,
             "structural_valid": not errors, "citations": citations, "doi_to_uri": uris,
             "number_to_doi": numbers, "bibliography_numbers": bibliography_numbers, "bibliography_text": bibliographies,
@@ -676,7 +733,29 @@ def _verify_root(root) -> dict:
 
 
 def verify(path: Path) -> dict:
+    """Verify main-document fields and disclose citations in auxiliary parts.
+
+    Auxiliary Zotero/EndNote fields are inventory only; their mappings are not
+    verified by _verify_root. Static numeric candidates remain ambiguous.
+    """
     result = _verify_root(document_root(path))
+    with ZipFile(path) as archive:
+        for name in archive.namelist():
+            if not re.fullmatch(r"word/(?:header\d+|footer\d+|footnotes|endnotes|comments)\.xml", name):
+                continue
+            try:
+                other = parse_xml(archive.read(name))
+            except ValueError:
+                result["coverage_warnings"].append("unreadable_auxiliary_xml:" + name)
+                continue
+            codes = "".join(other.xpath("//w:instrText/text()|//w:fldSimple/@w:instr", namespaces=NS))
+            kinds = [kind for token, kind in (("ZOTERO_", "zotero"), ("EN.CITE", "endnote"))
+                     if token in codes]
+            if kinds:
+                result["auxiliary_citation_parts"].append({"part": name, "field_types": kinds})
+        result["auxiliary_parts_checked"] = True
+    if result["auxiliary_citation_parts"]:
+        result["coverage_warnings"].append("auxiliary_citation_fields_not_verified")
     result.update(file=str(path.resolve()), sha256=sha256(path))
     return result
 

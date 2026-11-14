@@ -32,8 +32,10 @@ python -m litsearch_zotero.word_plugin finish --document review.docx --report sa
 
 前两条择一执行。用户未指定书签时使用当前光标，不编造书签位置。`preferences` 更换文档样式，`bibliography` 添加或编辑文末列表；仅在相应任务要求时调用。已有未保存编辑时，先明确其归属并保存，不丢弃。宏动作有独立备份；finish 返回 saved_for_verification，不构成 Zotero 异步完成回执。
 
+上面的 refresh/finish 用于需要完整文末列表的任务。新文稿仅插入第一条引用、当前没有文末域时，finish 会因缺少 bibliography 停止；不要为满足检查器擅自添加列表。先完成实际 Zotero 窗口并核对插入位置与域，按当前授权保存，交付插入状态；无法观察实际结果时只报告 dispatched。此时不能宣称完整文末对应已核实。
+
 ## 结果判读
 
 - `scan/prepare/convert/verify` 正常为 0；ready=false、结构失败或无效输入为 2。仍需读取 JSON：结构有效也可能 pending_refresh=true。
-- 完整核验看 `numeric_correspondence_verified`；缺 DOI 或使用非数字样式时不能虚报一一对应已证明。
+- 已识别动态域的编号对应看 `numeric_correspondence_verified`；缺 DOI 或使用非数字样式时不能虚报一一对应已证明。另检查 verification_scope、candidate_static_numbers、auxiliary_citation_parts 与 coverage_warnings；这些明确哪些正文静态候选或附属部件未包含在映射检查中。whole_document_coverage_verified=false 时不说“全文无漏引”。
 - API 不可达时可以继续离线 scan/verify；停止依赖 API 的步骤。插件、受保护文稿、条目歧义等阻塞应说明具体位置和所缺输入。

@@ -10,7 +10,13 @@ python -m litsearch --topic pantothenate --source europepmc --search-max 100 --o
 
 这是联网命令。PubMed 需要 `--email`；OpenAlex 需要 `--email` 和 `--openalex-api-key`，先核对本版本 `--help`。不要在公开日志回显凭据。默认不下载 PDF；本次要求下载时使用 `--download-pdfs --email ... --max-pdfs ...`。本地 PDF 使用 `--pdf-dir`，文件名不能证明身份匹配。
 
-新课题的完整配置以安装包 `litsearch/profiles/*.json` 及 `litsearch.topics.load_topic` 的实际 schema 为准，复制后修改，再用 `--topic topic.json` 验证；不要仅从此示例猜字段。工程主题另有 `litsearch.engineering`，不把 wet_etch 当主入口内置 topic。
+新课题的完整配置以安装包 `litsearch/profiles/*.json` 及 `litsearch.topics.load_topic` 的实际 schema 为准，复制后修改。可以离线校验：
+
+```text
+python -c "import sys; from litsearch.topics import load_topic; print(load_topic(sys.argv[1]).fingerprint)" topic.json
+```
+
+该命令中的路径应使用安全引号或参数传入；不把用户文字拼入 Python 源码。仅校验配置时不要运行主 `litsearch --topic topic.json`，因为它默认联网。通过 schema 只证明字段合法，不证明生物学筛选逻辑适用于该领域。工程主题另有 `litsearch.engineering`，不把 wet_etch 当主入口内置 topic。
 
 ## 离线复审
 
@@ -32,6 +38,14 @@ python -m litsearch.discovery --topic pantothenate --aliases-json aliases.json -
 两条分别表示仅规划和实际联网；不需要先重复执行计划。aliases.json 是普通短语数组。seeds.json 是种子数组，单项用 `{"doi":"10.1000/example"}` 或 `{"source":"MED","id":"123456"}`；这里只说明格式，不将示例标识当真实来源。Crossref 在此工具中不提供向前被引接口；用 Europe PMC 的可用路线，按实际结果说明覆盖范围。
 
 discovery.json 保留 candidates、identifiers、observations 的 payload/route/request_id、conflicts 和 approval；这些字段不等同于已通过身份核验的 Record。保留候选原始溯源，冲突来源不能静默选赢家。
+
+## 补漏候选进入主管线
+
+```text
+python -m litsearch.discovery_bridge discovery-live/discovery.json --out-dir discovery-import
+```
+
+查看 bridge_report.json 中 records、unresolved_observations 和 withheld_conflicting_candidates；records.json 只保留未授信书目，provenance.json 绑定输入 SHA、原观察来源、覆盖/错误/截断和冲突。冲突候选整项留在 provenance，不进入主去重流程，避免其隐式选出赢家。桥接不联网、不核验，也不替用户决定相关性；退出 0 只表示桥接执行完。仅在当前课题适配主筛选模型时，将输出 records.json 用作 `--from-json`；需要联网核验再加 `--verify-online`。旧安装包没有该模块时更新同一项目，不临时让模型猜字段绕过溯源保存。
 
 ## 结果判断
 

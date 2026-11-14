@@ -58,7 +58,7 @@ def main() -> int:
                 raise SystemExit(f"{name} was not imported from site-packages: {module_path}")
         print(json.dumps({"installed_sources": locations}, ensure_ascii=False))
 
-        for module in ("service_probe", "discovery", "document_parse"):
+        for module in ("service_probe", "discovery", "discovery_bridge", "document_parse"):
             run([sys.executable, "-m", "litsearch." + module, "--help"], cwd=fixture, env=env)
         for module in ("dynamic_citations", "word_plugin"):
             run([sys.executable, "-m", "litsearch_zotero." + module, "--help"], cwd=fixture, env=env)

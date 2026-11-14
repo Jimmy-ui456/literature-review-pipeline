@@ -116,7 +116,7 @@ def inspect_archive(archive: Path, config: dict) -> dict:
         expected=req if kind=="wheel" else "d_pan_literature_pipeline-3.0.0/"+req
         if expected not in names: findings.append({"path":expected,"rule":"required_member_missing"})
     required_modules=("litsearch/__init__.py","litsearch/cli.py","litsearch/core.py",
-                      "litsearch/service_probe.py","litsearch/discovery.py","litsearch/document_parse.py",
+                      "litsearch/service_probe.py","litsearch/discovery.py","litsearch/discovery_bridge.py","litsearch/document_parse.py",
                       "litsearch_zotero/__init__.py","litsearch_zotero/attach_pdfs.py",
                       "litsearch_zotero/dynamic_citations.py", "litsearch_zotero/word_plugin.py")
     for req in required_modules:
