@@ -81,10 +81,22 @@ def prepare_stage(root: Path, stage: Path, config: dict) -> tuple[list[dict], li
         dst=stage/rel; dst.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(p,dst)
         selected.append(rel)
     return findings, selected, excluded
-def archive_members(archive: Path) -> list[tuple[str,bool]]:
-    if archive.suffix==".whl" or zipfile.is_zipfile(archive):
-        with zipfile.ZipFile(archive) as z: return [(x.filename,stat.S_ISLNK(x.external_attr>>16)) for x in z.infolist()]
-    with tarfile.open(archive,"r:*") as t: return [(x.name,x.issym() or x.islnk()) for x in t.getmembers()]
+def archive_members(archive: Path) -> list[tuple[str, str]]:
+    if archive.suffix == ".whl" or zipfile.is_zipfile(archive):
+        with zipfile.ZipFile(archive) as package:
+            result = []
+            for member in package.infolist():
+                mode = stat.S_IFMT(member.external_attr >> 16) if member.create_system == 3 else 0
+                expected = stat.S_IFDIR if member.is_dir() else stat.S_IFREG
+                if mode not in (0, expected):
+                    kind = "special"
+                else:
+                    kind = "directory" if member.is_dir() else "file"
+                result.append((member.filename, kind))
+            return result
+    with tarfile.open(archive, "r:*") as package:
+        return [(member.name, "file" if member.isfile() else "directory" if member.isdir() else "special")
+                for member in package.getmembers()]
 def dependency_contract(line: str, package: str, bounds: tuple[str, ...], extra: str | None = None) -> bool:
     """Match exact emitted constraints/marker, never substrings like <4 in <40."""
     compact = re.sub(r"\s+", "", line).lower()
@@ -108,28 +120,47 @@ def archive_allowed(rel: str, kind: str, config: dict) -> bool:
             or re.fullmatch(r"skills(?:/(?:word-zotero-citations|literature-research|paper-data-extraction)(?:/(?:agents|references))?)?", inner) is not None
             or inner.endswith("/") or re.fullmatch(r"d_pan_literature_pipeline\.egg-info/(PKG-INFO|SOURCES\.txt|dependency_links\.txt|entry_points\.txt|requires\.txt|top_level\.txt)",inner) is not None or allowed(inner,config)[0])
 def inspect_archive(archive: Path, config: dict) -> dict:
-    kind="wheel" if archive.suffix==".whl" else "sdist"; members=archive_members(archive); findings=[]; names=[]
-    for name,link in members:
+    kind = "wheel" if archive.suffix == ".whl" else "sdist"
+    findings = []
+    names = []
+    seen = set()
+    files = set()
+    for name, member_kind in archive_members(archive):
         names.append(name)
-        if link or not archive_allowed(name,kind,config): findings.append({"path":name,"rule":"archive_link" if link else "archive_member_not_allowlisted"})
+        try:
+            normalized = safe_rel(name)
+        except ValueError:
+            findings.append({"path": name, "rule": "archive_member_not_allowlisted"})
+            continue
+        if normalized.casefold() in seen:
+            findings.append({"path": name, "rule": "duplicate_archive_member"})
+        seen.add(normalized.casefold())
+        if member_kind == "special":
+            findings.append({"path": name, "rule": "archive_special_member"})
+        elif normalized != name.rstrip("/") or not archive_allowed(normalized, kind, config):
+            findings.append({"path": name, "rule": "archive_member_not_allowlisted"})
+        elif member_kind == "file":
+            files.add(name)
     for req in ("litsearch/profiles/pantothenate.json","litsearch/profiles/lysine.json","litsearch/profiles/glutathione.json"):
         expected=req if kind=="wheel" else "d_pan_literature_pipeline-3.0.0/"+req
-        if expected not in names: findings.append({"path":expected,"rule":"required_member_missing"})
+        if expected not in files: findings.append({"path":expected,"rule":"required_member_missing"})
     required_modules=("litsearch/__init__.py","litsearch/cli.py","litsearch/core.py",
                       "litsearch/service_probe.py","litsearch/discovery.py","litsearch/discovery_bridge.py","litsearch/document_parse.py",
                       "litsearch_zotero/__init__.py","litsearch_zotero/attach_pdfs.py",
                       "litsearch_zotero/dynamic_citations.py", "litsearch_zotero/word_plugin.py")
     for req in required_modules:
         expected=req if kind=="wheel" else "d_pan_literature_pipeline-3.0.0/"+req
-        if expected not in names: findings.append({"path":expected,"rule":"required_member_missing"})
+        if expected not in files: findings.append({"path":expected,"rule":"required_member_missing"})
     if kind == "sdist":
         for skill in ("word-zotero-citations", "literature-research", "paper-data-extraction"):
             for member in ("SKILL.md", "agents/openai.yaml", "references/workflows.md"):
                 expected = "d_pan_literature_pipeline-3.0.0/skills/" + skill + "/" + member
-                if expected not in names:
+                if expected not in files:
                     findings.append({"path": expected, "rule": "required_skill_member_missing"})
-    metadata_name=(next((n for n in names if n.endswith(".dist-info/METADATA")), None) if kind=="wheel" else "d_pan_literature_pipeline-3.0.0/PKG-INFO")
+    metadata_name=("d_pan_literature_pipeline-3.0.0.dist-info/METADATA" if kind=="wheel" else "d_pan_literature_pipeline-3.0.0/PKG-INFO")
     try:
+        if metadata_name not in files:
+            raise KeyError(metadata_name)
         if kind=="wheel":
             with zipfile.ZipFile(archive) as z: metadata=z.read(metadata_name).decode("utf-8")
         else:
@@ -163,7 +194,7 @@ def inspect_archive(archive: Path, config: dict) -> dict:
     if not has_word_bridge:
         findings.append({"path":str(metadata_name), "rule":"optional_dependency_missing",
                          "detail":"citations:pywin32_windows_only"})
-    entry_name = (next((n for n in names if n.endswith(".dist-info/entry_points.txt")), None)
+    entry_name = ("d_pan_literature_pipeline-3.0.0.dist-info/entry_points.txt"
                   if kind == "wheel" else "d_pan_literature_pipeline-3.0.0/d_pan_literature_pipeline.egg-info/entry_points.txt")
     expected_entries = {
         "literature-cite": "litsearch_zotero.dynamic_citations:main",
@@ -174,6 +205,8 @@ def inspect_archive(archive: Path, config: dict) -> dict:
     }
     entries = configparser.ConfigParser(interpolation=None)
     try:
+        if entry_name not in files:
+            raise KeyError(entry_name)
         if kind == "wheel":
             with zipfile.ZipFile(archive) as z: entry_text = z.read(entry_name).decode("utf-8")
         else:

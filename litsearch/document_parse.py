@@ -1132,10 +1132,10 @@ def _ocr_image(image: Any, number: int, opts: Options, deadline: float, mapper=N
             "table_candidates": _ocr_rows(words, number)}
 
 
-def _ocr_pdf(path: Path, number: int, opts: Options, deadline: float) -> dict:
+def _ocr_pdf(raw: bytes, number: int, opts: Options, deadline: float) -> dict:
     pdfium = _dependency("pypdfium2", "ocr")
     _dependency("PIL.Image", "ocr")
-    with pdfium.PdfDocument(str(path)) as pdf:
+    with pdfium.PdfDocument(raw) as pdf:
         page = pdf[number - 1]
         try:
             width, height = page.get_size()
@@ -1150,6 +1150,12 @@ def _ocr_pdf(path: Path, number: int, opts: Options, deadline: float) -> dict:
                 bitmap.close()
         finally:
             page.close()
+
+
+def _report_json(report: dict):
+    """Use the same UTF-8 serialization for the budget check and the CLI file."""
+    yield from json.JSONEncoder(ensure_ascii=False, separators=(",", ":")).iterencode(report)
+    yield "\n"
 
 
 def parse_document(path: Path | str, options: Options | None = None) -> dict:
@@ -1177,12 +1183,15 @@ def parse_document(path: Path | str, options: Options | None = None) -> dict:
                   "Extraction is not scientific validation; units and values are never normalized",
                   "Missing cells stay null; candidate captions/notes and continuation are not asserted",
                   "PDF reading order and OCR/table recognition require human review"]}
+    table_cells = 0
+
     def add_tables(tables):
-        existing = sum(max(len(t["cells"]), sum(len(row) for row in t["grid"])) for t in report["tables"])
+        nonlocal table_cells
         extra = sum(max(len(t["cells"]), sum(len(row) for row in t["grid"])) for t in tables)
-        if existing + extra > opts.max_cells:
+        if table_cells + extra > opts.max_cells:
             raise ParseError("Document total cell/grid count exceeds max_cells")
         report["tables"].extend(tables)
+        table_cells += extra
     suffix = path.suffix.lower()
     if suffix in {".html", ".htm"}:
         selected_pages(opts.pages, 1, opts.max_pages)
@@ -1225,17 +1234,15 @@ def parse_document(path: Path | str, options: Options | None = None) -> dict:
                                                   "text_reconstruction": "extractor reading order; original characters retained"}
                         settings = {"vertical_strategy": opts.table_strategy,
                                     "horizontal_strategy": opts.table_strategy}
-                        found_tables = page.find_tables(settings)
                         text_strategy = opts.table_strategy == "text"
                         if text_strategy:
                             found_tables = _pdf_text_candidates(page, settings)
-                        elif not found_tables:
-                            # Borderless tables need the text strategy. It is run
-                            # only after ruled detection returns nothing, and its
-                            # candidates pass compact-region and column checks.
-                            found_tables = _pdf_text_candidates(page, {
-                                "vertical_strategy": "text", "horizontal_strategy": "text"})
-                            text_strategy = True
+                        else:
+                            found_tables = page.find_tables(settings)
+                            if not found_tables:
+                                found_tables = _pdf_text_candidates(page, {
+                                    "vertical_strategy": "text", "horizontal_strategy": "text"})
+                                text_strategy = True
                         for found in found_tables:
                             table = _pdf_table(page, found, f"table-{len(report['tables']) + 1}",
                                                number, opts, text_strategy=text_strategy)
@@ -1249,7 +1256,7 @@ def parse_document(path: Path | str, options: Options | None = None) -> dict:
                     needs_ocr = opts.ocr == "always" or (opts.ocr == "auto" and native_chars < opts.min_native_chars)
                     if needs_ocr:
                         try:
-                            page_report["ocr"] = _ocr_pdf(path, number, opts, deadline)
+                            page_report["ocr"] = _ocr_pdf(raw, number, opts, deadline)
                             add_tables(page_report["ocr"]["table_candidates"])
                             if page_report["ocr"]["quality"] == "noisy_or_empty":
                                 page_report["errors"].append({"layer": "ocr_quality", "error": "OCR empty or contains low-confidence words; unusable without review"})
@@ -1270,7 +1277,7 @@ def parse_document(path: Path | str, options: Options | None = None) -> dict:
         if opts.ocr == "off":
             raise ParseError("Image inputs require --ocr auto or --ocr always")
         image_module = _dependency("PIL.Image", "ocr")
-        with image_module.open(path) as image:
+        with image_module.open(io.BytesIO(raw)) as image:
             total = getattr(image, "n_frames", 1)
             report["total_pages"] = total
             for number in selected_pages(opts.pages, total, opts.max_pages):
@@ -1303,8 +1310,12 @@ def parse_document(path: Path | str, options: Options | None = None) -> dict:
         table["source_sha256"] = source_hash
     if report["errors"]:
         report["status"] = "partial"
-    if len((json.dumps(report, ensure_ascii=False, indent=2) + "\n").encode("utf-8")) > opts.max_output_bytes:
-        raise ParseError("Extraction exceeds max_output_bytes; select fewer pages")
+    output_bytes = 0
+    for chunk in _report_json(report):
+        output_bytes += len(chunk.encode("utf-8"))
+        if output_bytes > opts.max_output_bytes:
+            raise ParseError("Extraction exceeds max_output_bytes; select fewer pages")
+    _check(deadline)
     return report
 
 
@@ -1380,8 +1391,7 @@ def main(argv: list[str] | None = None) -> int:
         _fresh_output(args.out_dir)
         args.out_dir.mkdir(parents=True, exist_ok=False)
         with (args.out_dir / "document.json").open("x", encoding="utf-8", newline="\n") as output:
-            json.dump(report, output, ensure_ascii=False, indent=2)
-            output.write("\n")
+            output.writelines(_report_json(report))
         print(json.dumps({"output": str(args.out_dir / 'document.json'),
                           "status": report["status"], "pages": len(report["pages"]),
                           "tables": len(report["tables"])}, ensure_ascii=False))

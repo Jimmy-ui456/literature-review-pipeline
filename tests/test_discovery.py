@@ -255,6 +255,43 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIn("no_forward_endpoint", report["seed_routes"][0]["forward_citations"]["reason"])
         self.assertFalse(report["exhaustive_recall"])
 
+    def test_seed_summary_keeps_fallback_route_when_record_budget_runs_out(self):
+        plan = self.plan(seeds=[{"doi": "10.1234/seed"}], pages=4, records=1)
+
+        def handler(url):
+            if urlsplit(url).netloc == "api.crossref.org":
+                return {"status": "ok", "message": {"DOI": "10.1234/seed", "reference-count": 1,
+                        "reference": [{"DOI": "10.1234/child"}]}}
+            return page()
+
+        report, fake, _ = self.run_discovery(handler, plan)
+        self.assertEqual(urlsplit(fake.urls[-1]).netloc, "api.crossref.org")
+        backward = report["seed_routes"][0]["backward_citations"]
+        self.assertEqual(backward["route"]["provider"], "crossref")
+        self.assertEqual(backward["status"], "budget_truncated")
+        self.assertEqual(backward["reason"], "record_budget")
+        audit = next(row for row in report["coverage"] if row["route"] == backward["route"])
+        self.assertEqual(audit["page_attempts"], 1)
+        self.assertEqual(audit["status"], backward["status"])
+
+    def test_budget_marks_every_started_route_with_unread_pages(self):
+        plan = self.plan(aliases=["specific term"], pages=2)
+        report, _, _ = self.run_discovery(
+            lambda _: page(rows=[article("1"), article("2")], count=3), plan)
+        attempted = [row for row in report["coverage"] if row["page_attempts"]]
+        self.assertEqual(len(attempted), 2)
+        self.assertTrue(all(row["status"] == "budget_truncated" and row["reason"] == "page_budget"
+                            for row in attempted))
+
+    def test_network_error_keeps_specific_reason_and_single_request_diagnostic(self):
+        report, _, _ = self.run_discovery(lambda _: RuntimeError("network unavailable"),
+                                          self.plan(requests=1))
+        first = next(row for row in report["coverage"] if row["page_attempts"])
+        self.assertEqual(first["reason"], "request_or_response_failure")
+        self.assertEqual(first["status"], "failed")
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertEqual(report["errors"][0]["request_id"], 1)
+
     def test_doi_fallback_gets_budget_before_keyword_continuations(self):
         plan = self.plan(seeds=[{"doi": "10.1234/seed"}], pages=5)
         def handler(url):

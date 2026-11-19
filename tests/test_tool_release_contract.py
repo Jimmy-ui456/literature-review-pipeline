@@ -44,7 +44,8 @@ Requires-Dist: Pillow<13,>=10; extra == "parsing"
 
 class ToolReleaseContractTests(unittest.TestCase):
     def inspect(self, *, omitted: str = "", metadata: str = METADATA,
-                entries: str | None = ENTRIES, kind: str = "wheel") -> dict:
+                entries: str | None = ENTRIES, kind: str = "wheel",
+                extra_tar_members: tuple[tarfile.TarInfo, ...] = ()) -> dict:
         files = {name: "" for name in MODULES if name != omitted}
         for profile in ("pantothenate", "lysine", "glutathione"):
             files[f"litsearch/profiles/{profile}.json"] = "{}"
@@ -75,7 +76,23 @@ class ToolReleaseContractTests(unittest.TestCase):
                         member = tarfile.TarInfo("d_pan_literature_pipeline-3.0.0/" + name)
                         member.size = len(data)
                         handle.addfile(member, io.BytesIO(data))
+                    for member in extra_tar_members:
+                        member.name = "d_pan_literature_pipeline-3.0.0/" + member.name
+                        handle.addfile(member)
             return inspect_archive(archive, load_config(ROOT))
+
+    def test_archive_rejects_duplicate_file_paths(self):
+        duplicate = tarfile.TarInfo("litsearch/discovery.py")
+        report = self.inspect(kind="sdist", extra_tar_members=(duplicate,))
+        self.assertEqual(report["result"], "fail")
+        self.assertIn("duplicate_archive_member", {x["rule"] for x in report["findings"]})
+
+    def test_directory_does_not_satisfy_required_file(self):
+        directory = tarfile.TarInfo("litsearch/discovery.py")
+        directory.type = tarfile.DIRTYPE
+        report = self.inspect(kind="sdist", omitted=directory.name, extra_tar_members=(directory,))
+        self.assertEqual(report["result"], "fail")
+        self.assertIn("required_member_missing", {x["rule"] for x in report["findings"]})
 
     def test_wheel_and_sdist_have_complete_tool_contract(self):
         for kind in ("wheel", "sdist"):

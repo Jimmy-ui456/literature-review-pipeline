@@ -347,6 +347,16 @@ class Discovery:
         audit["status"] = "partial" if audit["pages_validated"] else "failed"
         audit["reason"] = reason
 
+    def _record_execution_error(self, route: dict, error: Exception, previous_errors: int) -> None:
+        if len(self.errors) > previous_errors:
+            return
+        audit = self._coverage_for(route)
+        reason = audit["reason"]
+        if reason is None or reason == "more_pages_available":
+            reason = "route_execution_failure"
+            self._fail_coverage(route, reason)
+        self.errors.append({"route": route, "error_type": type(error).__name__, "reason": reason})
+
     @staticmethod
     def _interleave(lanes: list[list[dict]]) -> list[dict]:
         """Take one route from each priority lane per round, preserving lane order."""
@@ -722,6 +732,7 @@ class Discovery:
         route, action = task["route"], task["action"]
         key = self._route_key(route)
         self._coverage_for(route)
+        previous_errors = len(self.errors)
         try:
             if task.get("provider") == "crossref":
                 stream = self._crossref_search_pages(task["query"], route, one_page=True)
@@ -767,11 +778,10 @@ class Discovery:
         except BudgetStop:
             raise
         except Exception as exc:
-            # Keep the route-specific failure without exposing exception text.
-            self._fail_coverage(route, "route_execution_failure")
-            if not any(row.get("route") == route for row in self.errors):
-                self.errors.append({"route": route, "error_type": type(exc).__name__,
-                                    "reason": "route_execution_failure"})
+            # The adapter already records failures tied to a specific request.
+            # Only add a generic error for a failure during observation handling.
+            self._record_execution_error(route, exc, previous_errors)
+            self._page_states.setdefault(key, {})["done"] = True
 
     def _run_scheduled(self, tasks: list[dict], *, first_round_only: bool = False,
                        reserve_pages: int = 0) -> bool:
@@ -935,26 +945,16 @@ class Discovery:
                 status="unavailable", reason="crossref_has_no_forward_endpoint")
             crossref_route = {"kind": "references", "provider": "crossref", "parent": parent,
                               "seed": seed, "direction": "backward", "depth": 1}
+            row["backward_citations"] = {"route": crossref_route}
+            previous_errors = len(self.errors)
             try:
                 refs = self._crossref(seed["doi"], parent, 1, seed)
-                row["backward_citations"] = {"status": self._coverage_for(crossref_route)["status"],
-                                             "route": crossref_route}
-                row["forward_citations"] = {"status": "unavailable",
-                                            "reason": "crossref_has_no_forward_endpoint",
-                                            "route": forward_epmc}
                 discovered.extend({"seed": child, "parent": child_id, "depth": 1}
                                   for child, child_id in refs)
             except BudgetStop:
                 return True
             except Exception as exc:
-                self._fail_coverage(crossref_route, "route_execution_failure")
-                row["backward_citations"] = {"status": self._coverage_for(crossref_route)["status"],
-                                             "route": crossref_route}
-                row["forward_citations"] = {"status": "unavailable",
-                                            "reason": "crossref_has_no_forward_endpoint",
-                                            "route": forward_epmc}
-                self.errors.append({"route": crossref_route, "error_type": type(exc).__name__,
-                                    "reason": "route_execution_failure"})
+                self._record_execution_error(crossref_route, exc, previous_errors)
             return False
 
         first_pass = self._interleave([user_alias_tasks, seed_tasks, source_tasks, term_tasks])
@@ -1117,6 +1117,7 @@ class Discovery:
                         crossref_route = {"kind": "references", "provider": "crossref", "parent": parent,
                                           "seed": task["route"]["seed"], "direction": "backward",
                                           "depth": task["depth"] + 1}
+                        previous_errors = len(self.errors)
                         try:
                             refs = self._crossref(doi, parent, task["depth"] + 1,
                                                   task["route"].get("seed"))
@@ -1126,9 +1127,7 @@ class Discovery:
                             stopped = True
                             break
                         except Exception as exc:
-                            self._fail_coverage(crossref_route, "route_execution_failure")
-                            self.errors.append({"route": crossref_route, "error_type": type(exc).__name__,
-                                                "reason": "route_execution_failure"})
+                            self._record_execution_error(crossref_route, exc, previous_errors)
             if stopped:
                 break
             if level_tasks:
@@ -1136,6 +1135,14 @@ class Discovery:
                 for task in level_tasks:
                     next_frontier.extend(self._task_results.get(self._route_key(task["route"]), []))
             frontier = next_frontier
+
+        if stopped and self.truncations:
+            stop_reason = self.truncations[-1]["reason"]
+            for audit in self.coverage:
+                if audit["status"] == "unattempted":
+                    audit["reason"] = stop_reason
+                elif audit["status"] == "partial" and audit["reason"] == "more_pages_available":
+                    audit.update(status="budget_truncated", reason=stop_reason)
 
         # Seed route summaries mirror the route-level audit without conflating
         # DOI lookup, backward references, and forward citations.
@@ -1146,15 +1153,10 @@ class Discovery:
                 if route:
                     coverage = self._coverage_for(route)
                     detail["status"] = coverage["status"]
-                    if coverage.get("reason"):
+                    if coverage["reason"] is not None:
                         detail["reason"] = coverage["reason"]
-        if stopped and self.truncations:
-            stop_reason = self.truncations[-1]["reason"]
-            for audit in self.coverage:
-                if audit["status"] == "unattempted":
-                    # Preserve the semantic distinction between work never
-                    # attempted and a route that began but was cut mid-stream.
-                    audit["reason"] = stop_reason
+                    else:
+                        detail.pop("reason", None)
         # Bridge observations can unify two stable IDs while their work is queued.
         # Resolve every graph/provenance parent only after all unions have settled.
         for edge in self.edges:
@@ -1167,6 +1169,10 @@ class Discovery:
         for row in self.unresolved + self.coverage + self.errors + self.truncations + self.requests:
             if "parent" in row.get("route", {}):
                 row["route"]["parent"] = self._canonical(row["route"]["parent"])
+        for seed_result in self.seed_routes:
+            route = seed_result["backward_citations"].get("route", {})
+            if "parent" in route:
+                route["parent"] = self._canonical(route["parent"])
         return {"schema_version": 2, "topic_fingerprint": self.plan["topic_fingerprint"],
                 "status": "partial" if self.errors or self.truncations else "bounded_retrieval_finished",
                 "candidate_status": "unreviewed", "approval": None, "exhaustive_recall": False,

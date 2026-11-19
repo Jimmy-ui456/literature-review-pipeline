@@ -193,6 +193,24 @@ class DocumentParseTests(unittest.TestCase):
         data = json.loads((target / "document.json").read_text(encoding="utf-8"))
         self.assertEqual(data["schema_version"], "document-parse/1")
 
+    def test_cli_budget_matches_written_utf8_bytes_with_unicode_input(self):
+        path = self.html("<p>" + "测试文字" * 200 + "</p>")
+        probe_limit = 9999
+        report = parse_document(path, Options(max_output_bytes=probe_limit))
+        compact = json.dumps(report, ensure_ascii=False, separators=(",", ":")) + "\n"
+        exact_limit = len(compact.encode("utf-8"))
+        self.assertEqual(len(str(exact_limit)), len(str(probe_limit)))
+        target = self.root / "exact"
+        self.assertEqual(main([str(path), "--out-dir", str(target),
+                               "--max-output-bytes", str(exact_limit)]), 0)
+        result = (target / "document.json").read_bytes()
+        self.assertEqual(len(result), exact_limit)
+        self.assertEqual(json.loads(result)["pages"], report["pages"])
+        over_limit = self.root / "over-limit"
+        self.assertEqual(main([str(path), "--out-dir", str(over_limit),
+                               "--max-output-bytes", str(exact_limit - 1)]), 2)
+        self.assertFalse(over_limit.exists())
+
     def test_bounded_worker_timeout(self):
         with self.assertRaises(ParseError):
             parse_bounded(self.html("text"), Options(max_seconds=.001))
